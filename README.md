@@ -234,4 +234,4 @@ This workflow is not about producing a specific “look”. It is about **produc
 
 Once the data is clean, balanced, and well behaved, artistic decisions become easier, safer, and more intentional.
 
-The Skynet Batch Post Processing pipeline exists to remove uncertainty — not creativity.
+The Skynet Batch Post Processing pipeline exists to remove uncertainty... not creativity.
