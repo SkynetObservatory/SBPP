@@ -1,16 +1,3 @@
-/*
-   Skynet Workflow Runner (Phase Based Edition)
-   Skynet Observatory > Batch Post Processing
-
-   Purpose
-   Loads master channels (SHO or RGB), applies a consistent linear workflow, combines,
-   color calibrates, then runs optional enhancement steps (NXT, BXT, SXT, stretch).
-
-   Notes
-   (1) LinearFit uses referenceViewId as fullId (matches PI behavior)
-   (2) Includes a small pause helper to let PI settle after heavy processes
-*/
-
 #feature-id    SkynetWorkflow : Skynet Observatory > Batch Post Processing
 
 #include <pjsr/Sizer.jsh>
@@ -25,14 +12,78 @@
 #define DEFAULT_AUTOSTRETCH_TBGND   0.25
 #define DEFAULT_AUTOSTRETCH_CLINK   true
 
-// Global progress object (assigned inside runWorkflow).
-// Declared at top-level to avoid scope issues in some PixInsight builds.
 var __progress = null;
 var __runStartMS = 0;
 
-// ------------------------------------------------------------
-// Helpers (UI responsiveness and timing)
-// ------------------------------------------------------------
+var __sbppPrereqOk = null;
+var __sbppPrereqDetected = [];
+
+
+
+function sbppValidatePrerequisites()
+{
+   var missing = [];
+   var detected = [];
+
+   function hasProcess( ctorName )
+   {
+      // PixInsight's JS engine may not define globalThis. Use the global object via non-strict 'this'.
+      var G = null;
+      try { G = (function(){ return this; })(); } catch ( __e0 ) { G = null; }
+      try
+      {
+         return ( G && typeof G[ ctorName ] === "function" );
+      }
+      catch ( __e )
+      {
+         return false;
+      }
+   }
+
+   function check( name, label )
+   {
+      if ( hasProcess( name ) )
+         detected.push( label );
+      else
+         missing.push( label );
+   }
+
+   check( "GraXpert", "GraXpert" );
+   check( "BlurXTerminator", "BXT" );
+   check( "NoiseXTerminator", "NXT" );
+   check( "StarXTerminator", "SXT" );
+
+   __sbppPrereqDetected = detected.slice( 0 );
+   __sbppPrereqOk = (missing.length === 0);
+
+   if ( !__sbppPrereqOk )
+   {
+      var msg =
+         "SBPP prerequisite check failed.\\n\\n" +
+         "The following required components are not installed:\\n\\n" +
+         "• " + missing.join( "\\n• " ) + "\\n\\n" +
+         "SBPP relies on these modules and will not function without them.\\n\\n" +
+         "Install the missing components and restart PixInsight.";
+
+
+
+
+      try
+      {
+         new MessageBox( msg, "SBPP – Missing Dependencies", StdIcon_Warning, StdButton_Ok ).execute();
+      }
+      catch ( __e )
+      {
+         try { Console.warningln( "[SBPP] Missing prerequisites: " + missing.join( ", " ) ); } catch ( __e2 ) {}
+      }
+
+      return false;
+   }
+
+   return true;
+}
+
+
 
 function pumpEvents()
 {
@@ -51,15 +102,11 @@ function pauseMs( ms )
 
 
 
-// Simple UI helper (global) so runWorkflow can update labels safely.
 function setLabelText( label, text )
 {
    try { if ( label ) label.text = text; } catch ( __e ) {}
 }
 
-// ------------------------------------------------------------
-// Help (embedded quick guide)
-// ------------------------------------------------------------
 
 var SBPP_HELP_TEXT =
 "Skynet Batch Post Processing (SBPP)\n\n" +
@@ -131,9 +178,6 @@ function sbppShowHelpDialog()
 }
 
 
-// ------------------------------------------------------------
-// Helpers (statistics and PixelMath suggestion)
-// ------------------------------------------------------------
 
 function __safeStat( s, propNames, fallback )
 {
@@ -151,10 +195,6 @@ function __safeStat( s, propNames, fallback )
    return fallback;
 }
 
-// Returns robust stats for a view image.
-// We prefer MAD (median absolute deviation) scaled to a sigma-equivalent,
-// and we also keep standard deviation as a secondary reference.
-// strength is the primary "signal/structure strength" metric we will use later.
 function getRobustViewStats( view )
 {
    var st = {};
@@ -166,16 +206,12 @@ function getRobustViewStats( view )
    st.mean   = __safeStat( S, [ "mean" ], 0 );
    st.median = __safeStat( S, [ "median" ], 0 );
 
-   // PixInsight naming differs across builds.
    st.stdDev = __safeStat( S, [ "standardDeviation", "stdDev", "sigma" ], 0 );
 
-   // MAD is robust; scale by ~1.4826 to estimate sigma for a normal distribution.
    var mad = __safeStat( S, [ "MAD", "mad" ], NaN );
    st.mad = isFinite( mad ) ? mad : NaN;
    st.madSigma = isFinite( st.mad ) ? (1.4826 * st.mad) : st.stdDev;
 
-   // Blend (mostly robust) to reduce sensitivity to outliers and residual gradients.
-   // 80% MAD-sigma + 20% stdDev.
    st.strength = 0.80 * st.madSigma + 0.20 * st.stdDev;
 
    return st;
@@ -188,7 +224,6 @@ function __clamp( x, a, b )
 
 function __fmt( x )
 {
-   // Keep short but stable: 3 decimals.
    return format( "%.3f", x );
 }
 
@@ -216,9 +251,6 @@ function __paletteTextSafe( dlg )
    return "SHO";
 }
 
-// Returns mapping of output channels to canonical input IDs (without suffix).
-// For RGB: R->R, G->G, B->B
-// For Narrowband: based on palette selection.
 function __paletteMapping( modeLabelOrMode, paletteText )
 {
    var m = __normalizeModeLabel( modeLabelOrMode );
@@ -228,23 +260,18 @@ function __paletteMapping( modeLabelOrMode, paletteText )
 
    var p = (paletteText || "SHO").toString().trim().toUpperCase();
 
-   // Defaults to SHO mapping.
    if ( p === "HSO" )
       return { R: "Ha",  G: "Sii", B: "Oiii", palette: "HSO" };
    if ( p === "HOO" )
       return { R: "Ha",  G: "Oiii", B: "Oiii", palette: "HOO" };
 
-   // SHO
    return { R: "Sii", G: "Ha",  B: "Oiii", palette: "SHO" };
 }
 
 
-// Suggest PixelMath expressions using pre-LinearFit stats.
-// (Later we may incorporate post-PSF stats too, but this gives us a stable baseline.)
 
 function suggestPixelMathExpressionsFromStats( mappingOrMode, statsByChannel )
 {
-   // Accept either a palette mapping object {R,G,B} or a mode string ("SHO"/"RGB").
    var mapping = null;
 
    if ( typeof mappingOrMode === "string" )
@@ -255,7 +282,7 @@ function suggestPixelMathExpressionsFromStats( mappingOrMode, statsByChannel )
    if ( !mapping || !mapping.R || !mapping.G || !mapping.B )
       mapping = __paletteMapping( "RGB", "RGB" );
 
-   var anchor = mapping.G; // reference channel for balancing
+   var anchor = mapping.G;
    var redCh  = mapping.R;
    var bluCh  = mapping.B;
 
@@ -275,26 +302,20 @@ function suggestPixelMathExpressionsFromStats( mappingOrMode, statsByChannel )
    var r = strengthOf( redCh );
    var b = strengthOf( bluCh );
 
-   // Fallback to plain channel mapping if stats are not available.
    if ( !isFinite( a ) || a <= 0 || !isFinite( r ) || !isFinite( b ) )
    {
       return { R: redCh, G: anchor, B: bluCh };
    }
 
-   // Ratios relative to anchor (anchor = 1.0).
    var rRatio = r / a;
    var bRatio = b / a;
 
-   // Policy
-   // If a channel is weak relative to anchor, inject a fraction of the anchor.
-   // This fraction grows smoothly as the ratio drops, but is capped to avoid "washing" color.
-   var trigger = 0.85;  // start helping below this
-   var maxMix  = 0.35;  // hard cap of anchor injection
+   var trigger = 0.85;
+   var maxMix  = 0.35;
 
    function mixAlpha( ratio )
    {
       if ( ratio >= trigger ) return 0.0;
-      // At ratio=0 -> alpha=maxMix, at ratio=trigger -> alpha=0.
       var alpha = (trigger - ratio) / trigger * maxMix;
       return __clamp( alpha, 0.0, maxMix );
    }
@@ -318,13 +339,6 @@ function suggestPixelMathExpressionsFromStats( mappingOrMode, statsByChannel )
 }
 
 
-// ------------------------------------------------------------
-// Helpers (I/O and naming)
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-// SBPP configuration persistence (PixInsight Settings-based)
-// (Avoids fragile filesystem paths and works cross-platform)
-// ------------------------------------------------------------
 
 var SBPP_SETTINGS_KEY = "Skynet/SBPP/Config";
 
@@ -344,13 +358,11 @@ function sbppCollectConfig( dlg )
 {
    var cfg = {};
 
-   // Step 1 (inputs)
    try { cfg.modeIndex = dlg.mode_Combo.currentItem; } catch ( __e ) {}
    try { cfg.mode = dlg.mode; } catch ( __e ) {}
    try { cfg.files = dlg.files ? dlg.files.slice( 0 ) : []; } catch ( __e ) {}
    try { cfg.outId = dlg.out_Edit.text; } catch ( __e ) {}
    try { cfg.paletteIndex = dlg.palette_Combo.currentItem; } catch ( __e ) {}
-   // Step 5 (combination method)
    try { cfg.combineUsePixelMath = dlg.combinePM_Radio ? dlg.combinePM_Radio.checked : false; } catch ( __e ) {}
    try { cfg.pmExprR = dlg.pmR_Edit ? dlg.pmR_Edit.text : ""; } catch ( __e ) {}
    try { cfg.pmExprG = dlg.pmG_Edit ? dlg.pmG_Edit.text : ""; } catch ( __e ) {}
@@ -358,26 +370,21 @@ function sbppCollectConfig( dlg )
 
    try { cfg.refPolicyId = dlg.getReferencePolicyId ? dlg.getReferencePolicyId() : 2; } catch ( __e ) {}
 
-   // Step 2 (Graxpert smoothing)
    try { cfg.bgSmoothing = dlg.bgSmoothing_Edit.text; } catch ( __e ) {}
 
-   // Step 6/7 (linear NXT / BXT)
    try { cfg.nxtIterations = dlg.nxtIterations_Edit.text; } catch ( __e ) {}
    try { cfg.nxtDenoise = dlg.nxtDenoise_Edit.text; } catch ( __e ) {}
    try { cfg.bxtSharpenStars = dlg.bxtSharpenStars_Edit.text; } catch ( __e ) {}
    try { cfg.bxtAdjustHalos = dlg.bxtAdjustHalos_Edit.text; } catch ( __e ) {}
    try { cfg.bxtSharpenNonstellar = dlg.bxtSharpenNonstellar_Edit.text; } catch ( __e ) {}
 
-   // Step 8/9 (SXT options)
    try { cfg.sxtUnscreen = dlg.sxtUnscreen_Check.checked; } catch ( __e ) {}
    try { cfg.sxtLargeOverlap = dlg.sxtLargeOverlap_Check.checked; } catch ( __e ) {}
    try { cfg.sxtGenerateStars = dlg.sxtGenerateStars_Check.checked; } catch ( __e ) {}
 
-   // Step 10 (stretch)
    try { cfg.stretch = dlg.stretch_Check.checked; } catch ( __e ) {}
    try { cfg.htTbg = dlg.htTbg_Edit.text; } catch ( __e ) {}
 
-   // Step 11 (MAS)
    try { cfg.masApply = dlg.masApply_Check.checked; } catch ( __e ) {}
    try { cfg.masPreview = dlg.masPreview_Check.checked; } catch ( __e ) {}
    try { cfg.masContrast = dlg.masContrast_Check.checked; } catch ( __e ) {}
@@ -390,7 +397,6 @@ function sbppCollectConfig( dlg )
    try { cfg.masSatBoost = dlg.masSatBoost_Edit.text; } catch ( __e ) {}
    try { cfg.masSatAmt = dlg.masSatAmt_Edit.text; } catch ( __e ) {}
 
-   // Step 12 (Nonlinear NXT/BXT)
    try { cfg.nlNxtApply = dlg.nlNxtApply_Check.checked; } catch ( __e ) {}
    try { cfg.nlNxtIterations = dlg.nlNxtIterations_Edit.text; } catch ( __e ) {}
    try { cfg.nlNxtDenoise = dlg.nlNxtDenoise_Edit.text; } catch ( __e ) {}
@@ -428,12 +434,10 @@ function sbppApplyConfig( dlg, cfg )
       if ( cfg.paletteIndex !== undefined && dlg.palette_Combo )
          dlg.palette_Combo.currentItem = cfg.paletteIndex;
 
-      // Step 1 (LinearFit reference policy)
       if ( cfg.refPolicyId !== undefined && dlg.setReferencePolicyId )
          dlg.setReferencePolicyId( cfg.refPolicyId );
 
  
-      // Step 5 (combination method)
       if ( cfg.combineUsePixelMath !== undefined && dlg.combineCC_Radio && dlg.combinePM_Radio )
       {
          dlg.combinePM_Radio.checked = !!cfg.combineUsePixelMath;
@@ -452,7 +456,6 @@ function sbppApplyConfig( dlg, cfg )
 
       if ( cfg.refPolicyId !== undefined )
 {
-   // Be tolerant: older saved configs may store strings.
    var pid = Number( cfg.refPolicyId );
    if ( !isFinite( pid ) ) pid = 2;
    pid = Math.round( pid );
@@ -464,7 +467,6 @@ function sbppApplyConfig( dlg, cfg )
       dlg.refMedium_Radio.checked  = (pid === 1);
       dlg.refHigh_Radio.checked    = (pid === 0);
 
-      // Safety: never allow "none selected".
       if ( !dlg.refHigh_Radio.checked && !dlg.refMedium_Radio.checked && !dlg.refHighest_Radio.checked )
          dlg.refHighest_Radio.checked = true;
    }
@@ -640,12 +642,10 @@ function guessKeyFromFilename( path )
    var s = path.toLowerCase();
    function hasToken( re ) { return re.test( s ); }
 
-   // Narrowband
    if ( hasToken( /(^|[^a-z0-9])(ha|h[-_ ]?a)([^a-z0-9]|$)/ ) ) return "Ha";
    if ( hasToken( /(^|[^a-z0-9])(sii|s2|s[-_ ]?ii)([^a-z0-9]|$)/ ) ) return "Sii";
    if ( hasToken( /(^|[^a-z0-9])(oiii|o3|o[-_ ]?iii)([^a-z0-9]|$)/ ) ) return "Oiii";
 
-   // Broadband
    if ( hasToken( /(^|[^a-z0-9])(r|red)([^a-z0-9]|$)/ ) ) return "R";
    if ( hasToken( /(^|[^a-z0-9])(g|green)([^a-z0-9]|$)/ ) ) return "G";
    if ( hasToken( /(^|[^a-z0-9])(b|blue)([^a-z0-9]|$)/ ) ) return "B";
@@ -668,7 +668,6 @@ function renameMainViewTo( view, desiredId )
    if ( view == null || desiredId == null || !desiredId.length )
       return;
 
-   // Avoid collisions by appending _N as needed
    var id = desiredId;
    var n = 1;
 
@@ -692,9 +691,6 @@ function renameMainViewTo( view, desiredId )
    }
 }
 
-// ------------------------------------------------------------
-// Helpers (statistics and STF)
-// ------------------------------------------------------------
 
 function calculateMean( viewId )
 {
@@ -711,7 +707,6 @@ function calculateMean( viewId )
       var st = getRobustViewStats( view );
       var mean = (st && isFinite( st.mean )) ? st.mean : 0;
 
-      // Log with at least 6 decimals for debugging and repeatability.
       Console.writeln( "Mean value for " + viewId + ": " + format( "%.6f", mean ) );
       return mean;
    }
@@ -819,9 +814,6 @@ function applyVisualSTF( view, shadowsClipping, targetBackground, rgbLinked )
 }
 
 
-// ------------------------------------------------------------
-// Helpers (LinearFit and combination)
-// ------------------------------------------------------------
 
 function linearFitToID( referenceViewId, targetViewId, logFn )
 {
@@ -867,7 +859,6 @@ function combineToRGB( rId, gId, bId, outId )
 
    var CC = new ChannelCombination;
 
-   // IMPORTANT: ChannelCombination has its own enum
    CC.colorSpace = ChannelCombination.prototype.RGB;
 
    CC.channels = [
@@ -899,15 +890,11 @@ function combineToRGB( rId, gId, bId, outId )
 
    pumpEvents();
 
-   // Visual only (unlinked for easier inspection after combine)
    applyVisualSTF( outWin.mainView, DEFAULT_AUTOSTRETCH_SCLIP, DEFAULT_AUTOSTRETCH_TBGND, false );
 
    return outWin.mainView;
 }
 
-// ------------------------------------------------------------
-// UI Dialog
-// ------------------------------------------------------------
 
 
 function firstExistingId( ids )
@@ -925,17 +912,18 @@ function firstExistingId( ids )
 
 function WorkflowDialog()
 {
+   if ( !sbppValidatePrerequisites() )
+      throw new Error( "__SBPP_PREREQ__" );
+
    this.__base__ = Dialog;
    this.__base__();
-
    var dlg = this;
 
-   this.windowTitle = "Skynet Batch Post-Processing (v1.8 Skynet Observatory, © 2026)";
+   this.windowTitle = "Skynet Batch Post-Processing (v1.9 Skynet Observatory, © 2026)";
    this.mode = "SHO";
    this.files = [];
    this.detected = [];
 
-   // Gate RUN WORKFLOW: start disabled until user explicitly selects files.
    this.__userHasSelectedFiles = false;
 
    function row( parent, labelText, control )
@@ -979,12 +967,8 @@ function WorkflowDialog()
 
       if ( expanded === undefined ) expanded = true;
 
-      // Bind bar to control (SectionBar will handle collapsing/expanding).
       try { bar.setSection( control ); } catch ( __e ) {}
 
-      // Some PI builds call onToggleSection with different signatures.
-      // IMPORTANT: When bound via setSection(), we must NOT manually toggle visibility here,
-      // or we can double-toggle and end up with the "flicker then collapse back" behavior.
       bar.onToggleSection = function()
       {
          if ( dlg.__inSectionToggle )
@@ -993,12 +977,10 @@ function WorkflowDialog()
          dlg.__inSectionToggle = true;
          try
          {
-            // Force full relayout after SectionBar changes geometry/ attachment.
             try { control.adjustToContents(); } catch ( __e1 ) {}
             try { dlg.sizer.adjustToContents(); } catch ( __e2 ) {}
             dlg.adjustToContents();
 
-            // Ensure UI refresh.
             dlg.update();
             dlg.repaint();
          }
@@ -1009,7 +991,6 @@ function WorkflowDialog()
       };
 
 
-      // Initial state
       control.visible = expanded;
       var v = new VerticalSizer;
       v.spacing = 4;
@@ -1040,9 +1021,6 @@ function WorkflowDialog()
       pumpEvents();
    }
 
-   // ---------------------------------------------------------
-   // Step 1: Files (unchanged)
-   // ---------------------------------------------------------
 
    this.mode_Combo = new ComboBox( this );
    this.mode_Combo.addItem( "SHO (Sii, Ha, Oiii)" );
@@ -1056,11 +1034,9 @@ function WorkflowDialog()
    this.detected_Text.readOnly = true;
    this.detected_Text.setScaledMinHeight( 100 );
 
-   // Stats panel (compact table) shown after file selection
-   // Rendered as a non-editable, monospace label inside a framed panel.
    this.stats_Label = new Label( this );
    this.stats_Label.useRichText = false;
-   this.stats_Label.textAlignment = 0 | 8; // TextAlign_Left | TextAlign_VertCenter
+   this.stats_Label.textAlignment = 0 | 8;
    this.stats_Label.margin = 0;
    try
    {
@@ -1069,7 +1045,6 @@ function WorkflowDialog()
       this.stats_Label.font = __sf;
    }
    catch ( __eFont ) {}
-   // Fit exactly header + up to 3 rows
    this.stats_Label.setFixedHeight( 100 );
 
    this.stats_Panel = new Control( this );
@@ -1081,10 +1056,9 @@ function WorkflowDialog()
    this.stats_Panel.sizer.add( this.stats_Label );
    try { this.stats_Panel.setFixedHeight( 126 ); } catch ( __eH ) {}
 
-   // Legend panel (compact) shown next to statistics panel
    this.legend_Label = new Label( this );
    this.legend_Label.useRichText = false;
-   this.legend_Label.textAlignment = 0 | 8; // TextAlign_Left | TextAlign_VertCenter
+   this.legend_Label.textAlignment = 0 | 8;
    this.legend_Label.margin = 0;
    try
    {
@@ -1093,7 +1067,7 @@ function WorkflowDialog()
       this.legend_Label.font = __lf;
    }
    catch ( __eFont2 ) {}
-   this.legend_Label.text = ""; // shown only after stats are populated
+   this.legend_Label.text = "";
    this.legend_Label.setFixedHeight( 100 );
 
    this.legend_Panel = new Control( this );
@@ -1114,9 +1088,8 @@ function WorkflowDialog()
 
    this.refHighest_Radio = new RadioButton( this );
    this.refHighest_Radio.text = "Use highest signal value";
-   this.refHighest_Radio.checked = true; // default
+   this.refHighest_Radio.checked = true;
 
-   // Safety: ensure one option is selected at startup (PixInsight can be picky).
    if ( this.refHigh_Radio && this.refMedium_Radio && this.refHighest_Radio )
       this.refHighest_Radio.checked = true;
 
@@ -1126,7 +1099,6 @@ function WorkflowDialog()
    this.out_Edit.text = "RGB";
    this.out_Edit.setFixedWidth( 110 );
 
-   // Help button next to Output ID
    this.help_Button = new PushButton( this );
    this.help_Button.text = "?";
    this.help_Button.toolTip = "Show SBPP workflow guide";
@@ -1150,16 +1122,12 @@ function WorkflowDialog()
       }
    };
 
-   // Composite control: Output ID + Help
    this.outHelp_Control = new Control( this );
    this.outHelp_Control.sizer = new HorizontalSizer;
    this.outHelp_Control.sizer.spacing = 4;
    this.outHelp_Control.sizer.add( this.out_Edit );
    this.outHelp_Control.sizer.add( this.help_Button );
 
-   // ---------------------------------------------------------
-   // Step 2: Background Extraction
-   // ---------------------------------------------------------
 
    this.bgSmoothing_Edit = new Edit( this );
    this.bgSmoothing_Edit.text = "0.50";
@@ -1169,23 +1137,14 @@ function WorkflowDialog()
    this.bgHint_Label.text = "Tip: 0.0 keeps more structure, 1.0 smooths more aggressively";
    this.bgHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Step 3: Linear Fit
-   // ---------------------------------------------------------
 
    this.lf_InfoLabel = new Label( this );
    this.lf_InfoLabel.text = "LinearFit using (select files) as Reference";
 
-   // ---------------------------------------------------------
-   // Step 4: PSF Correction
-   // ---------------------------------------------------------
 
    this.psf_InfoLabel = new Label( this );
    this.psf_InfoLabel.text = "BlurX applied with Correct Only option";
 
-   // ---------------------------------------------------------
-   // Step 5: Combination
-   // ---------------------------------------------------------
 
    this.combineCC_Radio = new RadioButton( this );
    this.combineCC_Radio.text = "Use Channel Combination";
@@ -1207,7 +1166,6 @@ function WorkflowDialog()
    this.pmB_Edit = new Edit( this );
    this.pmB_Edit.toolTip = "PixelMath expression for the Blue channel output.";
 
-   // Make Expr fields compact to leave room for an Initialize button
    this.pmR_Edit.setFixedWidth( 260 );
    this.pmG_Edit.setFixedWidth( 260 );
    this.pmB_Edit.setFixedWidth( 260 );
@@ -1227,16 +1185,10 @@ function WorkflowDialog()
    this.pmResume_Button.setFixedHeight( 22 );
    this.pmResume_Button.enabled = false;
 
-   // ---------------------------------------------------------
-   // Step 6: Color Correction
-   // ---------------------------------------------------------
 
    this.spcc_InfoLabel = new Label( this );
    this.spcc_InfoLabel.text = "SPCC settings applied according to Mode";
 
-   // ---------------------------------------------------------
-   // Step 7: Noise Reduction (Linear)
-   // ---------------------------------------------------------
 
    this.nxtDenoise_Edit = new Edit( this );
    this.nxtDenoise_Edit.text = "0.50";
@@ -1257,9 +1209,6 @@ function WorkflowDialog()
    this.nxtHint_Label.text = "Tip: use 2 iterations only if the background is clearly noisy";
    this.nxtHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Step 8: Sharpening (Linear)
-   // ---------------------------------------------------------
 
    this.bxtSharpenStars_Edit = new Edit( this );
    this.bxtSharpenStars_Edit.text = "0.50";
@@ -1274,9 +1223,6 @@ function WorkflowDialog()
    this.bxtHint_Label.text = "Tip: negative halos reduces star bloat; keep star sharpening modest";
    this.bxtHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Step 9: Star Extraction
-   // ---------------------------------------------------------
 
    this.sxtGenerateStars_Check = new CheckBox( this );
    this.sxtGenerateStars_Check.text = "Generate Star Image";
@@ -1294,17 +1240,8 @@ function WorkflowDialog()
    this.sxtHint_Label.text = "Large Overlap uses 0.50 (unchecked uses 0.20)";
    this.sxtHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Progress and run
-   // ---------------------------------------------------------
 
 
-   // ---------------------------------------------
-   // Step 10: Stretching
-   // ---------------------------------------------
-   // 10.1 HistogramTransformation (explicit checkbox)
-   // NOTE: We keep a dedicated checkbox instead of relying on GroupBox.checkable
-   // so the user can clearly enable or skip the HT stretch.
    this.stretch_Check = new CheckBox( this );
    this.stretch_Check.text = "Apply a HistogramTransformation stretch (STF to HT style).";
    this.stretch_Check.checked = true;
@@ -1316,10 +1253,9 @@ function WorkflowDialog()
    this.ht_Group.sizer = new VerticalSizer;
    this.ht_Group.sizer.margin = 6;
    this.ht_Group.sizer.spacing = 4;
-   // Target background for the auto-stretch transfer (DEFAULT_AUTOSTRETCH_TBGND)
 this.htTbg_Label = new Label( this );
 this.htTbg_Label.text = "TBGND:";
-this.htTbg_Label.textAlignment = 2|8; // TextAlign_Right | TextAlign_VertCenter
+this.htTbg_Label.textAlignment = 2|8;
 this.htTbg_Label.setFixedWidth( 60 );
 
 this.htTbg_Edit = new Edit( this );
@@ -1348,12 +1284,10 @@ this.ht_Group.sizer.add( htRow );
    this.mas_Group.title = "10.2 Multiscale Adaptive Stretch";
    this.mas_Group.checkable = false;
 
-   // Master enable for MAS
    this.masApply_Check = new CheckBox( this );
    this.masApply_Check.text = "Apply Multiscale Adaptive Stretch";
    this.masApply_Check.checked = false;
 
-   // MAS controls (enabled only when master checkbox is checked)
    this.masAgg_Edit = new Edit( this );          this.masAgg_Edit.text = "0.70";
    this.masAgg_Slider = new Slider( this );     this.masAgg_Slider.minValue = 0; this.masAgg_Slider.maxValue = 100; this.masAgg_Slider.value = 70;
 
@@ -1410,8 +1344,6 @@ this.ht_Group.sizer.add( htRow );
    linkEditSlider01( this.masSatAmt_Edit, this.masSatAmt_Slider );
    linkEditSlider01( this.masSatBoost_Edit, this.masSatBoost_Slider );
 
-   // Keep MAS labels readable in the compact UI by constraining slider widths.
-   // This prevents sliders from stretching across the whole row and clipping the left labels.
    var MAS_SLIDER_W = 480;
    this.masAgg_Slider.setFixedWidth( MAS_SLIDER_W );
    this.masTbg_Slider.setFixedWidth( MAS_SLIDER_W );
@@ -1423,7 +1355,6 @@ this.ht_Group.sizer.add( htRow );
    this.mas_Group.sizer.margin = 6;
    this.mas_Group.sizer.spacing = 6;
 
-   // Master enable lives at the top of the section.
    this.mas_Group.sizer.add( this.masApply_Check );
 
    var MAS_LABEL_W = 180;
@@ -1472,7 +1403,6 @@ this.ht_Group.sizer.add( htRow );
    {
       var master = dlg.masApply_Check.checked;
 
-      // Base controls controlled by master
       dlg.masAgg_Edit.enabled = master;
       dlg.masAgg_Slider.enabled = master;
       dlg.masTbg_Edit.enabled = master;
@@ -1483,12 +1413,10 @@ this.ht_Group.sizer.add( htRow );
       dlg.masContrast_Check.enabled = master;
       dlg.masSatEnabled_Check.enabled = master;
 
-      // Contrast Recovery subtree
       var cr = master && dlg.masContrast_Check.checked;
       dlg.masScale_Edit.enabled = cr;
       dlg.masPreview_Check.enabled = cr;
 
-      // Saturation subtree
       var sat = master && dlg.masSatEnabled_Check.checked;
       dlg.masSatAmt_Edit.enabled = sat;
       dlg.masSatAmt_Slider.enabled = sat;
@@ -1497,7 +1425,6 @@ this.ht_Group.sizer.add( htRow );
       dlg.masSatLM_Check.enabled = sat;
    }
 
-   // Wire dependencies
    this.masApply_Check.onCheck = function( checked )
    {
       updateMASControls();
@@ -1514,12 +1441,8 @@ this.ht_Group.sizer.add( htRow );
       updateMASControls();
    };
 
-   // Initial state
    updateMASControls();
 
-   // ---------------------------------------------------------
-   // Step 11: Noise Reduction (Nonlinear) (optional)
-   // ---------------------------------------------------------
    this.nlNxtApply_Check = new CheckBox( this );
    this.nlNxtApply_Check.text = "Apply Noise Reduction (Nonlinear)";
    this.nlNxtApply_Check.checked = false;
@@ -1543,9 +1466,6 @@ this.ht_Group.sizer.add( htRow );
    this.nlNxtHint_Label.text = "Tip: keep nonlinear denoise modest to avoid smearing dust";
    this.nlNxtHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Step 12: Sharpening (Nonlinear) (optional)
-   // ---------------------------------------------------------
    this.nlBxtApply_Check = new CheckBox( this );
    this.nlBxtApply_Check.text = "Apply Sharpening (Nonlinear)";
    this.nlBxtApply_Check.checked = false;
@@ -1563,9 +1483,6 @@ this.ht_Group.sizer.add( htRow );
    this.nlBxtHint_Label.text = "Tip: keep nonlinear sharpening conservative to avoid artifacts";
    this.nlBxtHint_Label.textColor = 0xFF808080;
 
-   // ---------------------------------------------------------
-   // Wiring and state for nonlinear steps
-   // ---------------------------------------------------------
 
    function syncNLDenoiseEditToSlider()
    {
@@ -1637,18 +1554,26 @@ this.ht_Group.sizer.add( htRow );
       setEditNumber( dlg.nlBxtSharpenNonstellar_Edit, v, 2 );
    };
 
-   // Link nonlinear slider with edit
    linkEditSlider01( this.nlNxtDenoise_Edit, this.nlNxtDenoise_Slider );
 
-   // Initial nonlinear state (disabled by default)
    updateNonlinearControls();
 
    this.progress_Text = new TextBox( this );
    this.progress_Text.readOnly = true;
    this.progress_Text.setScaledMinHeight( 120 );
 
+   try
+   {
+      if ( __sbppPrereqOk === true && dlg && dlg.progress_Text )
+      {
+         var msg = "Pre-requisites verification completed. GraXpert, BXT, NXT and SXT detected. Script can proceed";
+         dlg.progress_Text.text += msg + "\n";
+         try { Console.writeln( "<end><cbr>" + msg ); } catch ( __e1 ) {}
+      }
+   }
+   catch ( __e ) {}
 
-   // Overall progress (uses a disabled Slider because PixInsight PJSR has no built in ProgressBar control)
+
    this.progress_Bar = new Slider( this );
    this.progress_Bar.minValue = 0;
    this.progress_Bar.maxValue = 1;
@@ -1659,16 +1584,29 @@ this.ht_Group.sizer.add( htRow );
    this.progress_Status = new Label( this );
    this.progress_Status.text = "0%";
 
+   this.updateProgress = function( stepIndex, totalSteps )
+   {
+      try
+      {
+         var s = Math.max( 0, Math.min( stepIndex, totalSteps ) );
+         var t = Math.max( 1, totalSteps );
+
+         this.progress_Bar.minValue = 0;
+         this.progress_Bar.maxValue = 1000;
+         this.progress_Bar.value = Math.round( (s / t) * 1000 );
+
+         this.progress_Status.text = "" + Math.round( (s / t) * 100 ) + "%";
+      }
+      catch ( __e ) {}
+   };
+
 
    this.ok_Button = new PushButton( this );
    this.ok_Button.text = "RUN WORKFLOW";
    this.ok_Button.setFixedHeight( 60 )
-   // Disabled by default. It will be enabled only when the required number of
-   // master files are selected for the chosen mode (SHO=2, RGB=3).
    this.ok_Button.enabled = false;
    this.ok_Button.onClick = function()
    {
-      // Prevent accidental double runs
       if ( dlg.__isRunning )
          return;
 
@@ -1690,41 +1628,30 @@ this.ht_Group.sizer.add( htRow );
 
       dlg.__isRunning = false;
 
-      // Re-evaluate button enabled state based on current selections
       try { dlg.updateRunButtonState(); } catch ( __e3 ) { dlg.ok_Button.enabled = true; }
       pumpEvents();
    };
 
-   // ---------------------------------------------------------
-   // ---------------------------------------------------------
-   // Layout (compact but consistent)
-   // ---------------------------------------------------------
    var main = new VerticalSizer;
    main.margin = 10;
    main.spacing = 8;
 
-   // Step 1: Files
    var s1c = new Control( this ); s1c.sizer = new VerticalSizer;
    s1c.sizer.spacing = 4;
 
-   // Mode + Output on one row
    s1c.sizer.add( row2( this, "Mode:", this.mode_Combo, "Output ID:", this.outHelp_Control ) );
 
-   // File picker and detected list
    s1c.sizer.add( this.pick_Button );
    s1c.sizer.add( this.detected_Text );
 
-   // Stats panel (compact table) - half width
    var statsRow = new HorizontalSizer;
    statsRow.add( this.stats_Panel, 50 );
    statsRow.add( this.legend_Panel, 50 );
    s1c.sizer.add( statsRow );
 
-   // Reference
-   // LinearFit Reference (policy)
    var refLbl = new Label( this );
    refLbl.text = "Reference for Linear Fit:";
-   refLbl.textAlignment = 0 | 8; // Left | VertCenter
+   refLbl.textAlignment = 0 | 8;
    s1c.sizer.add( refLbl );
 
    s1c.sizer.add( this.refHigh_Radio );
@@ -1733,42 +1660,34 @@ this.ht_Group.sizer.add( htRow );
 
    main.add( section( "Step 1: Files", s1c, true ) );
 
-   // Run
    main.addSpacing( 6 );
    main.add( this.ok_Button );
 
 
-   // Step 2: Background Extraction
    var s2c = new Control( this ); s2c.sizer = new VerticalSizer;
    s2c.sizer.spacing = 4;
    s2c.sizer.add( row( this, "Smoothing:", this.bgSmoothing_Edit ) );
    s2c.sizer.add( this.bgHint_Label );
    main.add( section( "Step 2: Background Extraction", s2c, false ) );
 
-   // Step 3: Linear Fit
    var s3c = new Control( this ); s3c.sizer = new VerticalSizer;
    s3c.sizer.spacing = 4;
    s3c.sizer.add( this.lf_InfoLabel );
    main.add( section( "Step 3: Linear Fit", s3c, true ) );
 
-   // Step 4: PSF Correction
    var s4c = new Control( this ); s4c.sizer = new VerticalSizer;
    s4c.sizer.spacing = 4;
    s4c.sizer.add( this.psf_InfoLabel );
    main.add( section( "Step 4: PSF Correction", s4c, false ) );
 
-   // Step 5: Combination
    var s5c = new Control( this ); s5c.sizer = new VerticalSizer;
    s5c.sizer.spacing = 6;
 
-   // Palette (affects both ChannelCombination and PixelMath mapping)
    s5c.sizer.add( row( this, "Palette:", this.palette_Combo ) );
 
-   // Combination method
    s5c.sizer.addSpacing( 4 );
    s5c.sizer.add( this.combineCC_Radio );
 
-   // PixelMath option (expressions)
    s5c.sizer.addSpacing( 4 );
    s5c.sizer.add( this.combinePM_Radio );
    var pmRow = new HorizontalSizer; pmRow.spacing = 6;
@@ -1795,25 +1714,20 @@ this.ht_Group.sizer.add( htRow );
 
    main.add( section( "Step 5: Combination", s5c, true ) );
 
-   // Step 6: Color Correction
    var s6c = new Control( this ); s6c.sizer = new VerticalSizer;
    s6c.sizer.spacing = 4;
    s6c.sizer.add( this.spcc_InfoLabel );
    main.add( section( "Step 6: Color Correction", s6c, false ) );
 
-   // Step 7: Noise Reduction (Linear)
    var s7c = new Control( this ); s7c.sizer = new VerticalSizer;
    s7c.sizer.spacing = 4;
 
    var nxtRow = new HorizontalSizer; nxtRow.spacing = 6;
    var denL = new Label( this ); denL.text = "Denoise:"; denL.textAlignment = 2 | 8; denL.setFixedWidth( 120 );
    this.nxtDenoise_Edit.setFixedWidth( 60 );
-   // Ensure "Iterations" label never gets clipped (right-aligned labels can clip on the left).
    var itL = new Label( this ); itL.text = "Iterations:"; itL.textAlignment = 2 | 8; itL.setFixedWidth( 110 );
    this.nxtIterations_Edit.setFixedWidth( 40 );
 
-   // Keep the slider from colliding with the Iterations controls.
-   // The dialog is compact by design, so we constrain the slider width.
    this.nxtDenoise_Slider.setFixedWidth( 300 );
 
    nxtRow.add( denL );
@@ -1826,16 +1740,13 @@ this.ht_Group.sizer.add( htRow );
    s7c.sizer.add( this.nxtHint_Label );
    main.add( section( "Step 7: Noise Reduction (Linear)", s7c, false ) );
 
-   // Step 8: Sharpening (Linear)
    var s8c = new Control( this ); s8c.sizer = new VerticalSizer;
    s8c.sizer.spacing = 4;
-   // Make the edits about one third of the row width, and give labels enough space.
    this.bxtSharpenStars_Edit.setFixedWidth( 120 );
    this.bxtAdjustHalos_Edit.setFixedWidth( 120 );
    this.bxtSharpenNonstellar_Edit.setFixedWidth( 120 );
 
    var s8r1 = new HorizontalSizer; s8r1.spacing = 6;
-   // Wider labels to avoid clipping in compact layouts.
    var s8l1 = new Label( this ); s8l1.text = "Sharpen Stars:"; s8l1.textAlignment = 2 | 8; s8l1.setFixedWidth( 180 );
    var s8l2 = new Label( this ); s8l2.text = "Adjust Star Halos:"; s8l2.textAlignment = 2 | 8; s8l2.setFixedWidth( 180 );
    s8r1.add( s8l1 );
@@ -1855,7 +1766,6 @@ this.ht_Group.sizer.add( htRow );
    s8c.sizer.add( this.bxtHint_Label );
    main.add( section( "Step 8: Sharpening (Linear)", s8c, false ) );
 
-   // Step 9: Star Extraction
    var s9c = new Control( this ); s9c.sizer = new VerticalSizer;
    s9c.sizer.spacing = 4;
 
@@ -1869,20 +1779,16 @@ this.ht_Group.sizer.add( htRow );
 
    main.add( section( "Step 9: Star Extraction", s9c, false ) );
 
-   // Step 10: Stretching
    var s10c = new Control( this ); s10c.sizer = new VerticalSizer;
    s10c.sizer.spacing = 6;
 
-   // 10.1 HistogramTransformation
    s10c.sizer.add( this.ht_Group );
 
-   // 10.2 MAS
    s10c.sizer.add( this.mas_Group );
 
    main.add( section( "Step 10: Stretching", s10c, false ) );
 
 
-   // Step 11: Noise Reduction (Nonlinear) (optional)
    var s11c = new Control( this ); s11c.sizer = new VerticalSizer;
    s11c.sizer.spacing = 4;
 
@@ -1904,7 +1810,6 @@ this.ht_Group.sizer.add( htRow );
 
    main.add( section( "Step 11: Noise Reduction (Nonlinear)", s11c, false ) );
 
-   // Step 12: Sharpening (Nonlinear) (optional)
    var s12c = new Control( this ); s12c.sizer = new VerticalSizer;
    s12c.sizer.spacing = 4;
 
@@ -1934,7 +1839,6 @@ this.ht_Group.sizer.add( htRow );
    var progLabel = new Label( this ); progLabel.text = "Progress";
    main.add( progLabel );
 
-   // Progress bar + status
    var progRow = new HorizontalSizer; progRow.spacing = 8;
    progRow.add( this.progress_Bar, 100 );
    progRow.add( this.progress_Status );
@@ -1943,18 +1847,10 @@ this.ht_Group.sizer.add( htRow );
    main.add( this.progress_Text, 100 );
 
    this.sizer = main;
-   // Slightly wider to prevent label truncation in compact mode.
-   // Make the dialog wider (additional +10% per latest UI tweak request).
    this.setMinSize( 970, 900 );
-   // UI behavior and synchronization
-   // ---------------------------------------------------------
 
-   // Run button gating.
-   // SHO mode: enable only when exactly 2 or 3 files are selected.
-   // RGB mode: enable only when exactly 3 files are selected.
    this.updateRunButtonState = function()
    {
-      // Always keep RUN WORKFLOW disabled until the user explicitly selects files in this session.
       if ( !this.__userHasSelectedFiles )
       {
          this.ok_Button.enabled = false;
@@ -1989,12 +1885,9 @@ this.ht_Group.sizer.add( htRow );
 
       this.detected_Text.text = lines.join( "\n" );
 
-      // Reference selection is policy-based (mean-driven) via radio buttons.
-      // We only refresh the LinearFit label here.
 
       this.updateLinearFitLabel();
 
-      // Gate the run button after any file selection / detection update.
       this.updateRunButtonState();
    };
 
@@ -2012,34 +1905,28 @@ this.ht_Group.sizer.add( htRow );
          this.palette_Combo.addItem( "SHO" );
          this.palette_Combo.addItem( "HSO" );
          this.palette_Combo.addItem( "HOO" );
-         this.palette_Combo.currentItem = 0; // Default: SHO
+         this.palette_Combo.currentItem = 0;
       }
 
 
-      // Palette selection affects both ChannelCombination and PixelMath mappings.
-      // Keep PixelMath expressions aligned with the current palette.
       try { this.applyPixelMathDefaultsForce(); } catch ( __e ) {}
 
    };
 
 
-   // Step 5 enablement (ChannelCombination vs PixelMath)
    this.updateCombinationControls = function()
    {
       var useCC = ( dlg.combineCC_Radio && dlg.combineCC_Radio.checked );
       var usePM = ( dlg.combinePM_Radio && dlg.combinePM_Radio.checked );
 
-      // Palette is always enabled (affects both ChannelCombination and PixelMath mappings).
       if ( dlg.palette_Combo )
          dlg.palette_Combo.enabled = true;
 
-      // PixelMath expression inputs only relevant when using PixelMath.
       if ( dlg.pmR_Edit ) dlg.pmR_Edit.enabled = usePM;
       if ( dlg.pmG_Edit ) dlg.pmG_Edit.enabled = usePM;
       if ( dlg.pmB_Edit ) dlg.pmB_Edit.enabled = usePM;
    };
 
-   // Step 5 PixelMath defaults (mode-aware)
    this.applyPixelMathDefaultsIfEmpty = function()
    {
       var isRGB = ( dlg.mode === "RGB" );
@@ -2062,7 +1949,6 @@ this.ht_Group.sizer.add( htRow );
          dlg.pmB_Edit.text = defB;
    };
 
-   // Step 5 PixelMath defaults (force reset)
    this.applyPixelMathDefaultsForce = function()
    {
       var modeLabel = ( dlg.mode === "RGB" ) ? "RGB" : "SHO";
@@ -2086,10 +1972,6 @@ this.ht_Group.sizer.add( htRow );
 
 
 
-
-
-
-   // PixelMath pause/resume support (used when combining via PixelMath)
    dlg._pmResumeRequested = false;
    this.waitForPixelMathResume = function()
    {
@@ -2097,7 +1979,6 @@ this.ht_Group.sizer.add( htRow );
       if ( dlg.pmResume_Button )
          dlg.pmResume_Button.enabled = true;
 
-      // Let the user review/modify Expr values, then click Resume.
       while ( !dlg._pmResumeRequested )
          pauseMs( 100 );
 
@@ -2112,7 +1993,6 @@ this.ht_Group.sizer.add( htRow );
       };
    this.getReferencePolicyId = function()
    {
-      // 0 = lowest, 1 = medium, 2 = highest (default)
       if ( this.refHighest_Radio && this.refHighest_Radio.checked ) return 2;
       if ( this.refMedium_Radio && this.refMedium_Radio.checked ) return 1;
       return 0;
@@ -2120,7 +2000,6 @@ this.ht_Group.sizer.add( htRow );
 
    this.setReferencePolicyId = function( id )
    {
-      // 0 = lowest, 1 = medium, 2 = highest
       id = Math.round( Number( id ) );
       if ( !isFinite( id ) ) id = 2;
       if ( id < 0 ) id = 0;
@@ -2130,7 +2009,6 @@ this.ht_Group.sizer.add( htRow );
       if ( this.refMedium_Radio )   this.refMedium_Radio.checked = (id === 1);
       if ( this.refHighest_Radio )  this.refHighest_Radio.checked = (id === 2);
 
-      // Safety: never allow "none selected".
       if ( this.refHigh_Radio && this.refMedium_Radio && this.refHighest_Radio )
       {
          if ( !this.refHigh_Radio.checked && !this.refMedium_Radio.checked && !this.refHighest_Radio.checked )
@@ -2150,8 +2028,6 @@ this.ht_Group.sizer.add( htRow );
                           "Use lowest signal (Mean minus Median)";
    };
 
-   // Returns a compact stats string for UI labels.
-   // st: {mean, median, delta, id}
    this._formatRefStatText = function( st )
    {
       if ( !st ) return "";
@@ -2160,8 +2036,6 @@ this.ht_Group.sizer.add( htRow );
       return id + " (Δ " + f6( st.delta ) + ", μ " + f6( st.mean ) + ", m " + f6( st.median ) + ")";
    };
 
-   // Updates the Step 3 label in the UI (before RUN) to reflect the chosen policy,
-   // and if we have preview stats from file selection, include the candidate view.
    this.updateLinearFitLabel = function()
    {
       var id = this.getReferencePolicyId();
@@ -2181,7 +2055,6 @@ this.ht_Group.sizer.add( htRow );
       setLabelText( this.lf_InfoLabel, "LinearFit reference: " + this.getReferencePolicyLabel() );
    };
 
-   // Compute mean, median, delta (Mean minus Median) for a PixInsight view.
    this.computeMeanMedianDelta = function( view )
    {
       var r = { mean: NaN, median: NaN, delta: NaN };
@@ -2209,8 +2082,6 @@ this.ht_Group.sizer.add( htRow );
       return r;
    };
 
-   // Build reference preview stats from selected files (opens files briefly, computes stats, closes).
-   // Populates dlg.__refPreview and updates radio labels accordingly.
    this.updateReferencePreviewFromFiles = function()
    {
       this.__refPreview = null;
@@ -2253,19 +2124,16 @@ this.ht_Group.sizer.add( htRow );
       var isSHO = ( this.mode_Combo.currentItem === 0 );
       var wanted = isSHO ? [ "Sii", "Ha", "Oiii" ] : [ "R", "G", "B" ];
 
-      // Populate stats panel in UI (ordered by channel)
       try
       {
          if ( this.stats_Label )
          {
             var lines = [];
 
-            // Header
             lines.push( "          Δ          μ          m" );
 
             function fmtRow( id, st )
             {
-               // id left, then delta, mean, median aligned (monospaced)
                return format( "%-4s %10.6f %10.6f %10.6f", id, st.delta, st.mean, st.median );
             }
 
@@ -2318,7 +2186,6 @@ this.ht_Group.sizer.add( htRow );
 
       this.updateLinearFitLabel();
    };
-// Update overall progress bar (call from runWorkflow)
    this.setProgress = function( current, total, caption )
    {
       if ( total == null || total < 1 ) total = 1;
@@ -2345,15 +2212,11 @@ this.mode_Combo.onItemSelected = function( i )
       dlg.applyPixelMathDefaultsIfEmpty();
    };
 
-   // Palette changes should immediately update PixelMath expressions, regardless of combination method.
-   // Track previous palette so we can remap current PixelMath expressions instead of resetting them.
    dlg.__lastPaletteText = __paletteTextSafe( dlg );
    dlg.__inPaletteRemap = false;
 
    dlg.remapPixelMathExpressionsForPaletteChange = function( newPaletteText )
    {
-      // Remap whatever is currently in the Expr boxes according to the palette change.
-      // We do NOT regenerate defaults here (that's what Initialize is for).
       try
       {
          var modeLabel = ( dlg.mode === "RGB" ) ? "RGB" : "SHO";
@@ -2370,16 +2233,12 @@ this.mode_Combo.onItemSelected = function( i )
             B: ( dlg.pmB_Edit ? String( dlg.pmB_Edit.text || "" ) : "" )
          };
 
-         // Build a logical-channel -> expression map based on the OLD palette.
-         // This preserves any custom PixelMath expressions.
          var logical = {};
          function setLogical( ch, expr )
          {
             if ( !ch ) return;
             expr = ( expr === undefined || expr === null ) ? "" : String( expr );
 
-            // Prefer non-empty expressions. If duplicates exist (e.g., HOO has Oiii twice),
-            // keep the first non-empty one.
             if ( logical[ch] === undefined || String( logical[ch] ).length === 0 )
                logical[ch] = expr;
             else if ( String( logical[ch] ).length === 0 && expr.length > 0 )
@@ -2394,7 +2253,6 @@ this.mode_Combo.onItemSelected = function( i )
          {
             if ( logical[ch] !== undefined )
                return String( logical[ch] );
-            // Fallback to identity channel name
             return String( ch || "" );
          }
 
@@ -2406,7 +2264,6 @@ this.mode_Combo.onItemSelected = function( i )
       }
       catch ( __e )
       {
-         // As a safe fallback, keep current expressions unchanged.
       }
    };
 
@@ -2429,18 +2286,16 @@ this.mode_Combo.onItemSelected = function( i )
       };
 
 
-   // LinearFit reference policy radios
    this.refHigh_Radio.onCheck = function( checked ){ if ( checked ) dlg.updateLinearFitLabel(); };
    this.refMedium_Radio.onCheck = function( checked ){ if ( checked ) dlg.updateLinearFitLabel(); };
    this.refHighest_Radio.onCheck = function( checked ){ if ( checked ) dlg.updateLinearFitLabel(); };
 
-   // Step 5: Combination method (mutually exclusive)
    this.combineCC_Radio.onCheck = function( checked )
    {
       if ( checked )
       {
          dlg.combinePM_Radio.checked = false;
-         dlg.updatePaletteItems(); // items depend on Mode
+         dlg.updatePaletteItems();
          dlg.updateCombinationControls();
          dlg.applyPixelMathDefaultsIfEmpty();
       }
@@ -2451,7 +2306,7 @@ this.mode_Combo.onItemSelected = function( i )
       if ( checked )
       {
          dlg.combineCC_Radio.checked = false;
-         dlg.updatePaletteItems(); // items depend on Mode
+         dlg.updatePaletteItems();
          dlg.updateCombinationControls();
          dlg.applyPixelMathDefaultsIfEmpty();
       }
@@ -2462,23 +2317,18 @@ this.mode_Combo.onItemSelected = function( i )
       var fd = new OpenFileDialog;
       fd.multipleSelections = true;
 
-            // Mode-aware file filters.
-      // OpenFileDialog in PJSR expects Qt-style filter strings (not addFilter()).
-      // We provide multiple filters and keep "All Files (*)" as a fallback.
-      // The first filter in the list becomes the default selection, so we order
-      // filters to match the current Mode.
 
       var isSHO = ( dlg.mode_Combo.currentItem === 0 );
       var filters = [];
 
-      if ( dlg.mode_Combo.currentItem == 0 ) // SHO
+      if ( dlg.mode_Combo.currentItem == 0 )
       {
          filters.push( [ "SHO Masters (Ha, Sii, Oiii)", "*Ha*.* *HA*.* *Sii*.* *SII*.* *Oiii*.* *OIII*.*" ] );
          filters.push( [ "Ha Masters", "*Ha*.* *HA*.*" ] );
          filters.push( [ "Sii Masters", "*Sii*.* *SII*.*" ] );
          filters.push( [ "Oiii Masters", "*Oiii*.* *OIII*.*" ] );
       }
-      else // RGB
+      else
       {
          filters.push( [ "RGB Masters (R, G, B)", "*_R*.* *_G*.* *_B*.* *Red*.* *Green*.* *Blue*.*" ] );
          filters.push( [ "Red / R Masters", "*_R*.* *Red*.*" ] );
@@ -2532,7 +2382,6 @@ dlg.detected = [];
    };
 
    
-   // Clamp and normalize numeric inputs (UX safety)
    this.bgSmoothing_Edit.onEditCompleted = function()
    {
       var v = clamp( dlg.bgSmoothing_Edit.text, 0.0, 1.0 );
@@ -2564,16 +2413,12 @@ dlg.detected = [];
       setEditNumber( dlg.bxtSharpenNonstellar_Edit, v, 2 );
    };
 
-// Load persisted configuration (Settings)
    sbppTryLoadLastConfiguration( dlg );
 
-   // Safety: if persisted config left radios unchecked, force default (highest).
    try { dlg.setReferencePolicyId( dlg.getReferencePolicyId() ); } catch ( __e ) { try { dlg.setReferencePolicyId( 2 ); } catch ( __e2 ) {} }
 
-   // Apply mode-aware PixelMath defaults if expressions were not previously set.
    this.applyPixelMathDefaultsIfEmpty();
 
-   // Initialize dependent UI
    this.refreshDetectedUI();
    this.updatePaletteItems();
    this.updateCombinationControls();
@@ -2586,9 +2431,6 @@ dlg.detected = [];
 }
 WorkflowDialog.prototype = new Dialog;
 
-// ------------------------------------------------------------
-// Runner Logic
-// ------------------------------------------------------------
 
 
 function formatElapsedMMSS( elapsedMs )
@@ -2617,48 +2459,40 @@ function runWorkflow( dlg )
       dlg.progress_Text.text += s + "\n";
       pumpEvents();
    }
-// ---------------------------------------------------------
-// Step helpers (consistent logging and optional progress hook)
-// ---------------------------------------------------------
-var __stepIndex = 0;
-// Total steps depend on whether stretching is enabled.
-// Steps: Load, STF, Means, GraXpert, LinearFit, BXTco, Combine, SPCC, NXT, BXT, SXT, (optional) Stretch
-var __totalSteps = 11 + ((dlg.stretch_Check && dlg.stretch_Check.checked) ? 1 : 0) + ((dlg.masApply_Check && dlg.masApply_Check.checked) ? 1 : 0);
 
-function beginStep( title )
+   var __totalSteps = 12;
+
+
+   function beginStep( n, title )
 {
-   ++__stepIndex;
+   __stepIndex = n;
    log( "" );
-   log( "Step " + __stepIndex + "/" + __totalSteps + ": " + title );
-
-   // Optional hook for future progress UI controls
-   try { if ( typeof dlg.updateProgress === "function" ) dlg.updateProgress( __stepIndex, __totalSteps ); } catch ( __e ) {}
+   log( "Step " + n + "/" + __totalSteps + ": " + title );
+   try { if ( typeof dlg.updateProgress === "function" ) dlg.updateProgress( n, __totalSteps ); } catch ( __e ) {}
 }
 
-function endStep( note )
+
+   function logSub( s )
+{
+   try { log( "   " + s ); } catch ( __e ) {}
+}
+
+
+   function endStep( note )
 {
    if ( note && note.length )
       log( note );
 
    try { if ( typeof dlg.updateProgress === "function" ) dlg.updateProgress( __stepIndex, __totalSteps ); } catch ( __e ) {}
 }
-
-
-   log( "Run started" );
+log( "Run started" );
 
    tick( "Start" );
    if ( !dlg.detected || dlg.detected.length < 1 )
       throw new Error( "No files selected. Use Select Master Files first." );
 
-   // Active keys for this run
    var keys = ( dlg.mode === "RGB" ) ? ["R","G","B"] : ["Ha","Sii","Oiii"];
 
-   // ---------------------------------------------------------
-      // ---------------------------------------------------------
-   // Progress tracking (centralized)
-   // We count frequent micro steps so the bar moves often, but all progress
-   // advancement goes through a single function to prevent drift/off by one.
-   // ---------------------------------------------------------
    var present = {};
    for ( var pd = 0; pd < dlg.detected.length; ++pd )
    {
@@ -2670,40 +2504,39 @@ function endStep( note )
    for ( var pk = 0; pk < keys.length; ++pk )
       if ( present[keys[pk]] ) presentKeys.push( keys[pk] );
 
-   // If detection is weird, fall back to the full key list
    if ( presentKeys.length < 1 )
       presentKeys = keys;
 
    function computeTotalProgressSteps()
    {
       var t = 0;
-      t += 1;                    // start
-      t += presentKeys.length;   // open and rename
-      t += presentKeys.length;   // STF
-      t += presentKeys.length;   // mean measurements
-      t += presentKeys.length;   // GraXpert
-      t += Math.max( 0, presentKeys.length - 1 ); // LinearFit targets
-      t += 1;                    // rename reference to *_lf
-      t += presentKeys.length;   // BXT correct only
-      t += 1;                    // combination
-      t += 1;                    // SPCC
-      t += 1;                    // NXT
-      t += 1;                    // BXT (linear sharpen)
-      t += 1;                    // SXT
+      t += 1;
+      t += presentKeys.length;
+      t += presentKeys.length;
+      t += presentKeys.length;
+      t += presentKeys.length;
+      t += Math.max( 0, presentKeys.length - 1 );
+      t += 1;
+      t += presentKeys.length;
+      t += 1;
+      t += 1;
+      t += 1;
+      t += 1;
+      t += 1;
       if ( dlg.stretch_Check && dlg.stretch_Check.checked )
-         t += 1;                 // HT stretch
+         t += 1;
       if ( dlg.masApply_Check && dlg.masApply_Check.checked )
-         t += 1;                 // MAS stretch
+         t += 1;
       var __nStretch = 0;
       if ( dlg.stretch_Check && dlg.stretch_Check.checked ) __nStretch += 1;
       if ( dlg.masApply_Check && dlg.masApply_Check.checked ) __nStretch += 1;
 
       if ( dlg.nlNxtApply_Check && dlg.nlNxtApply_Check.checked )
-         t += __nStretch;         // Nonlinear NXT on each stretched starless output
+         t += __nStretch;
 
       if ( dlg.nlBxtApply_Check && dlg.nlBxtApply_Check.checked )
-         t += __nStretch;         // Nonlinear BXT on each stretched starless output
-      t += 1;                    // cleanup/done
+         t += __nStretch;
+      t += 1;
       return t;
    }
 
@@ -2714,14 +2547,12 @@ function endStep( note )
       total: totalSteps,
       advance: function( caption )
       {
-         // Clamp to total to guarantee we can always hit 100%.
          this.current = Math.min( this.current + 1, this.total );
          if ( typeof dlg.setProgress === "function" )
             dlg.setProgress( this.current, this.total, caption || "" );
       },
       done: function()
       {
-         // Force a clean 100% state, even if a later change forgets a tick.
          this.current = this.total;
          if ( typeof dlg.setProgress === "function" )
             dlg.setProgress( this.total, this.total, "Done" );
@@ -2738,13 +2569,9 @@ function endStep( note )
    }
 
 
-   // Track loaded views by canonical key
    var viewsByKey = {};
 
-   // ---------------------------------------------------------
-   // Step 1: Open and rename to canonical identifiers
-   // ---------------------------------------------------------
-   beginStep( "Loading images and applying canonical identifiers" );
+   beginStep( 1, "Files" );
 
    for ( var i = 0; i < dlg.detected.length; i++ )
    {
@@ -2772,10 +2599,7 @@ function endStep( note )
       tick( "Loaded " + key );
    }
 
-   // ---------------------------------------------------------
-   // Step 2: Apply STF (visual only) to each loaded view
-   // ---------------------------------------------------------
-   beginStep( "Applying STF (visual) to loaded images" );
+   logSub( "Applying STF (visual) to loaded images" );
 
    for ( var k = 0; k < keys.length; k++ )
    {
@@ -2794,10 +2618,7 @@ function endStep( note )
       }
    }
 
-   // ---------------------------------------------------------
-   // Step 3: Suggest reference (highest mean)
-   // ---------------------------------------------------------
-   beginStep( "Calculating mean values (suggest highest mean as Reference)" );
+   logSub( "Calculating statistics for reference selection" );
 
    var bestId = "";
    var bestMean = -1;
@@ -2823,7 +2644,6 @@ function endStep( note )
 
    if ( bestId.length )
    {
-      // Keep the suggested values around for logging / diagnostics.
       dlg.__suggestedReferenceId = bestId;
       dlg.__suggestedReferenceMean = bestMean;
       log( "Suggested Reference (highest mean): " + bestId + " (mean=" + bestMean + ")" );
@@ -2833,11 +2653,7 @@ function endStep( note )
       log( "No valid views found to compute mean. Reference policy will still apply later." );
    }
 
-   // ---------------------------------------------------------
-   // Step 4: GraXpert background extraction
-   // Output is renamed to {id}_g
-   // ---------------------------------------------------------
-   beginStep( "GraXpert background extraction" );
+   beginStep( 2, "Background Extraction" );
 
    var gx = new GraXpert;
    gx.backgroundExtraction = true;
@@ -2845,7 +2661,6 @@ function endStep( note )
    if ( isNaN( gx.smoothing ) ) gx.smoothing = 0.5;
    gx.smoothing = Math.range( gx.smoothing, 0.0, 1.0 );
 
-   // Correction mode
    gx.correction = "Subtraction";
 
    gx.createBackground = false;
@@ -2892,26 +2707,19 @@ function endStep( note )
       outWin.show();
       outWin.bringToFront();
 
-      // Visual feedback only
       applyVisualSTF( outWin.mainView );
 
       viewsG[cid] = outWin.mainView;
 		tick( "GraXpert " + cid );
    }
 
-   log( "Step 2: GraXpert completed." );
+   logSub( "GraXpert completed." );
 
-   // ---------------------------------------------------------
-   // Step 5: LinearFit (on _g images)
-   // Target outputs are renamed to *_g_lf
-   // Reference is also renamed to *_g_lf (reference is not processed)
-   // ---------------------------------------------------------
-   beginStep( "LinearFit (on _g images)" );
+   beginStep( 3, "Linear Fit" );
 
    
    function chooseReferenceBaseId( keys, policyId )
    {
-      // policyId: 0=lowest signal, 1=medium signal, 2=highest signal
       var arr = [];
       for ( var i = 0; i < keys.length; ++i )
       {
@@ -2969,13 +2777,9 @@ var refGWin = ImageWindow.windowById( refGId );
    }
    catch ( __e )
    {
-      // If stats fail for any reason, keep a reasonable label.
       setLabelText( dlg.lf_InfoLabel, "LinearFit using " + refGId + " as Reference" );
    }
 
-   // Capture pre-LinearFit robust statistics for each working _g view.
-   // We store these keyed by the logical channel id (keys[] baseId),
-   // so the values remain valid after later renames to canonical ids.
    var __preLinearFitStats = {};
    for ( var s = 0; s < keys.length; ++s )
    {
@@ -3033,11 +2837,7 @@ var refGWin = ImageWindow.windowById( refGId );
 	tick( "LinearFit reference renamed" );
    log( "LinearFit applied to all images" );
 
-   // ---------------------------------------------------------
-   // Step 6: BXT (Correct Only) on *_g_lf images
-   // Output rename: *_g_lf_BXTco
-   // ---------------------------------------------------------
-   beginStep( "BXT PSF (Correct Only)" );
+   beginStep( 4, "PSF Correction" );
 
    var bxt = new BlurXTerminator;
    bxt.ai_file = "BlurXTerminator.4.pb";
@@ -3079,8 +2879,6 @@ var refGWin = ImageWindow.windowById( refGId );
 
    log( "BXT PSF completed. Outputs renamed to canonical ids (Ha, Sii, Oiii, R, G, B)" );
 
-   // Use captured pre-LinearFit stats to suggest PixelMath expressions (for Step 7 UI fields).
-// We only auto-fill if the user hasn't customized expressions (blank or basic defaults).
 
 var __modeLabel = "";
 if ( dlg.mode_Combo )
@@ -3109,8 +2907,6 @@ function __shouldAutofill( currentText, which )
    return t === __defaultFor( which );
 }
 
-// Apply suggestions to PM fields (even if ChannelCombination is selected) so they are visible.
-// We still respect user customizations (only fill if blank or basic defaults).
 if ( dlg.pmR_Edit && __shouldAutofill( dlg.pmR_Edit.text, "R" ) )
    dlg.pmR_Edit.text = __suggested.R;
 
@@ -3124,13 +2920,8 @@ log( "PixelMath suggestion (" + (__modeLabel.length ? __modeLabel : __mode) + ")
 
 
 
-   // ---------------------------------------------------------
-   // Step 7: Combination (ChannelCombination)
-   // Inputs: *_g_lf_BXTco
-   // SHO mapping: Sii to R, Ha to G, Oiii to B
-   // ---------------------------------------------------------
    
-beginStep( "Combination" );
+beginStep( 5, "Combination" );
 
    function requireWin( id )
    {
@@ -3143,22 +2934,17 @@ beginStep( "Combination" );
 
    function copyAstrometricMetadata( srcWin, dstWin )
 {
-   // Preferred, robust method: use PixInsight's built-in copyAstrometricSolution().
-   // This preserves both the basic WCS keywords and the high-precision distortion model (when present).
    if ( srcWin == null || srcWin.isNull || dstWin == null || dstWin.isNull )
       return false;
 
    if ( !srcWin.hasAstrometricSolution )
       return false;
 
-   // In PixInsight, copyAstrometricSolution is a method of ImageWindow.
    dstWin.copyAstrometricSolution( srcWin );
    return true;
 }
 
 
-   // Canonical naming after Step 6: Ha, Sii, Oiii, R, G, B
-   // (Suffixes removed to make PixelMath expressions simpler.)
    var suffix = "";
 
    var rId, gId, bId;
@@ -3174,7 +2960,6 @@ beginStep( "Combination" );
    }
    else
    {
-      // Narrowband canonical IDs (palette affects both ChannelCombination and PixelMath mapping)
       var __ptext = "SHO";
       try { if ( dlg.palette_Combo ) __ptext = dlg.palette_Combo.itemText( dlg.palette_Combo.currentItem ); } catch ( __e ) {}
       var __m = __paletteMapping( "SHO", __ptext );
@@ -3183,7 +2968,6 @@ beginStep( "Combination" );
       bId = __m.B + suffix;
    }
 
-   // Ensure required windows exist (at least the canonical channel windows)
    requireWin( rId );
    requireWin( gId );
    requireWin( bId );
@@ -3192,27 +2976,19 @@ beginStep( "Combination" );
    if ( outId.length === 0 )
       outId = "RGB";
 
-   // Decide combination method according to Step 5 radio buttons
    var usePixelMath = ( dlg.combinePM_Radio && dlg.combinePM_Radio.checked );
 
    if ( usePixelMath )
    {
-      // ---------------------------------------------------------
-      // PixelMath-based combination
 
-      // Pause to allow user to review/modify the suggested PixelMath Expr values.
       log( "ACCEPT/MODIFY SUGGESTED Expr VALUES. HIT Resume TO CONTINUE... " );
       if ( dlg.waitForPixelMathResume )
          dlg.waitForPixelMathResume();
 
-      // ---------------------------------------------------------
-      // PixelMath-based combination (RGB expressions)
-      // ---------------------------------------------------------
       var exprR = ( dlg.pmR_Edit ? String( dlg.pmR_Edit.text ).trim() : "" );
       var exprG = ( dlg.pmG_Edit ? String( dlg.pmG_Edit.text ).trim() : "" );
       var exprB = ( dlg.pmB_Edit ? String( dlg.pmB_Edit.text ).trim() : "" );
 
-      // Fall back to canonical IDs if fields are empty
       if ( exprR.length === 0 ) exprR = rId;
       if ( exprG.length === 0 ) exprG = gId;
       if ( exprB.length === 0 ) exprB = bId;
@@ -3223,11 +2999,10 @@ beginStep( "Combination" );
       log( "B Expr = " + exprB );
       log( "Creating combined image: " + outId );
 
-      // PixelMath creates the new RGB image using the geometry of the target view (use anchor)
       var P = new PixelMath;
-      P.expression  = exprR;     // R
-      P.expression1 = exprG;     // G
-      P.expression2 = exprB;     // B
+      P.expression  = exprR;
+      P.expression1 = exprG;
+      P.expression2 = exprB;
       P.expression3 = "";
       P.useSingleExpression = false;
       P.symbols = "";
@@ -3252,14 +3027,11 @@ beginStep( "Combination" );
       P.newImageColorSpace = PixelMath.prototype.RGB;
       P.newImageSampleFormat = PixelMath.prototype.SameAsTarget;
 
-      // Execute on anchor view (Ha for SHO, G for RGB)
       var anchorWin = requireWin( gId );
       if ( !P.executeOn( anchorWin.mainView ) )
          throw new Error( "PixelMath execution failed." );
 
       pumpEvents();
-         // Copy astrometric metadata (WCS) from the anchor mono image to the PixelMath RGB output,
-      // so downstream SPCC/SPPC can work on the combined image.
       var outWin = ImageWindow.windowById( outId );
       if ( outWin == null || outWin.isNull )
          outWin = ImageWindow.activeWindow;
@@ -3275,9 +3047,6 @@ beginStep( "Combination" );
 }
    else
    {
-      // ---------------------------------------------------------
-      // ChannelCombination-based combination (existing behavior)
-      // ---------------------------------------------------------
       if ( dlg.mode === "RGB" )
       {
          log( "Combining RGB using ChannelCombination" );
@@ -3342,7 +3111,6 @@ beginStep( "Combination" );
       }
    }
 
-   // Ensure output is visible and active
    var outWin2 = ImageWindow.windowById( outId );
    if ( outWin2 && !outWin2.isNull )
    {
@@ -3355,10 +3123,7 @@ beginStep( "Combination" );
    log( "Combination complete: " + outId );
 
 	tick( "Combination" );
-// ---------------------------------------------------------
-   // Step 8: Spectrophotometric Color Calibration (mode aware)
-   // ---------------------------------------------------------
-   beginStep( "Spectrophotometric Color Calibration" );
+   beginStep( 6, "Color Correction" );
 
    var finalId = ( dlg.out_Edit.text || "" ).trim();
    var combinedWin = ImageWindow.windowById( finalId );
@@ -3368,7 +3133,6 @@ beginStep( "Combination" );
    var combinedView = combinedWin.mainView;
    var spcc = new SpectrophotometricColorCalibration;
 
-   // Common settings
    spcc.catalogId = "GaiaDR3SP";
    spcc.autoLimitMagnitude = true;
    spcc.targetSourceCount = 8000;
@@ -3378,10 +3142,8 @@ beginStep( "Combination" );
    spcc.backgroundLow = -2.80;
    spcc.backgroundHigh = 2.00;
 
-   // Camera QE curve
    spcc.deviceQECurve = "402,0.7219,404,0.7367,406,0.75,408,0.7618,410,0.7751,412,0.787,414,0.7944,416,0.8018,418,0.8112,420,0.8214,422,0.8343,424,0.8462,426,0.8536,428,0.8595,430,0.8639,432,0.8713,434,0.8757,436,0.8802,438,0.8861,440,0.8905,442,0.895,444,0.8994,446,0.9038,448,0.9068,450,0.9112,452,0.9142,454,0.9172,456,0.9168,458,0.9151,460,0.9134,462,0.9117,464,0.91,466,0.9083,468,0.9066,470,0.9049,472,0.9032,474,0.9015,476,0.8997,478,0.898,480,0.8963,482,0.8946,484,0.8929,486,0.8912,488,0.8876,490,0.8846,492,0.8877,494,0.8904,496,0.893,498,0.8964,500,0.8964,502,0.895,504,0.8945,506,0.8922,508,0.8899,510,0.8876,512,0.8853,514,0.883,516,0.8807,518,0.8784,520,0.8761,522,0.8743,524,0.8728,526,0.8698,528,0.8669,530,0.8624,532,0.858,534,0.855,536,0.8506,538,0.8476,540,0.8432,542,0.8402,544,0.8358,546,0.8328,548,0.8284,550,0.8254,552,0.821,554,0.8166,556,0.8136,558,0.8092,560,0.8062,562,0.8023,564,0.7983,566,0.7944,568,0.7899,570,0.787,572,0.7825,574,0.7781,576,0.7751,578,0.7707,580,0.7663,582,0.7618,584,0.7559,586,0.75,588,0.7441,590,0.7396,592,0.7337,594,0.7278,596,0.7219,598,0.716,600,0.7101,602,0.7056,604,0.6997,606,0.695,608,0.6905,610,0.6852,612,0.6808,614,0.6763,616,0.6719,618,0.6675,620,0.663,622,0.6583,624,0.6553,626,0.6509,628,0.6464,630,0.642,632,0.6376,634,0.6317,636,0.6272,638,0.6213,640,0.6154,642,0.6109,644,0.6036,646,0.5962,648,0.5902,650,0.5843,652,0.5799,654,0.574,656,0.5695,658,0.5636,660,0.5592,662,0.5545,664,0.5504,666,0.5462,668,0.542,670,0.5378,672,0.5328,674,0.5286,676,0.5244,678,0.5203,680,0.5163,682,0.5133,684,0.5089,686,0.5044,688,0.4985,690,0.4926,692,0.4867,694,0.4793,696,0.4719,698,0.4645,700,0.4586,702,0.4541,704,0.4497,706,0.4453,708,0.4408,710,0.4364,712,0.432,714,0.4275,716,0.4216,718,0.4186,720,0.4142,722,0.4127,724,0.4103,726,0.4078,728,0.4053,730,0.4024,732,0.3979,734,0.3935,736,0.3891,738,0.3831,740,0.3802,742,0.3772,744,0.3743,746,0.3713,748,0.3669,750,0.3624,752,0.3595,754,0.3559,756,0.3526,758,0.3494,760,0.3462,762,0.3429,764,0.3397,766,0.3364,768,0.3332,770,0.33,772,0.3267,774,0.3235,776,0.3203,778,0.317,780,0.3138,782,0.3106,784,0.3073,786,0.3041,788,0.3009,790,0.2976,792,0.2937,794,0.2905,796,0.2873,798,0.284,800,0.2808,802,0.2776,804,0.2743,806,0.2731,808,0.2703,810,0.2674,812,0.2646,814,0.2618,816,0.2589,818,0.2561,820,0.2533,822,0.2504,824,0.2476,826,0.2456,828,0.2439,830,0.2433,832,0.2427,834,0.2421,836,0.2416,838,0.2411,840,0.2382,842,0.2322,844,0.2278,846,0.2219,848,0.2175,850,0.2114,852,0.2069,854,0.2023,856,0.1978,858,0.1932,860,0.1918,862,0.1911,864,0.1904,866,0.1897,868,0.189,870,0.1883,872,0.1879,874,0.1834,876,0.179,878,0.1731,880,0.1672,882,0.1612,884,0.1568,886,0.1524,888,0.1479,890,0.1464,892,0.1464,894,0.1464,896,0.1464,898,0.1481,900,0.1494,902,0.1494,904,0.1494,906,0.1464,908,0.1435,910,0.1391,912,0.1346,914,0.1302,916,0.1257,918,0.1228,920,0.1183,922,0.1139,924,0.1109,926,0.1093,928,0.1085,930,0.108,932,0.108,934,0.108,936,0.108,938,0.108,940,0.1058,942,0.1039,944,0.1021,946,0.0998,948,0.0958,950,0.0918,952,0.0888,954,0.0828,956,0.0769,958,0.074,960,0.0714,962,0.0695,964,0.0677,966,0.0658,968,0.0651,970,0.0636,972,0.0626,974,0.0616,976,0.0606,978,0.0596,980,0.0586,982,0.0576,984,0.0567,986,0.0557,988,0.0547,990,0.0537,992,0.0527,994,0.0517,996,0.0507";
 
-   // Mode specific behavior
    if ( dlg.mode_Combo.currentItem == 0 )
    {
       log( "Mode: SHO (Narrowband Settings)" );
@@ -3419,7 +3181,6 @@ beginStep( "Combination" );
       spcc.broadbandIntegrationStepSize = 0.50;
    }
 
-   // Filter transmission curves
    spcc.redFilterTrCurve = "400,0.088,402,0.084,404,0.080,406,0.076,408,0.072,410,0.068,412,0.065,414,0.061,416,0.058,418,0.055,420,0.052,422,0.049,424,0.046,426,0.044,428,0.041,430,0.039,432,0.037,434,0.035,436,0.033,438,0.031,440,0.030,442,0.028,444,0.027,446,0.026,448,0.025,450,0.024,452,0.023,454,0.022,456,0.021,458,0.021,460,0.021,462,0.020,464,0.020,466,0.020,468,0.020,470,0.020,472,0.021,474,0.021,476,0.022,478,0.022,480,0.023,482,0.024,484,0.025,486,0.026,488,0.027,490,0.028,492,0.029,494,0.031,496,0.032,498,0.034,500,0.036,502,0.037,504,0.039,506,0.041,508,0.043,510,0.045,512,0.048,514,0.050,516,0.052,518,0.055,520,0.057,522,0.060,524,0.063,526,0.071,528,0.072,530,0.070,532,0.067,534,0.064,536,0.059,538,0.054,540,0.050,542,0.045,544,0.041,546,0.037,548,0.034,550,0.032,552,0.031,554,0.031,556,0.032,558,0.035,560,0.038,562,0.043,564,0.048,566,0.055,568,0.062,570,0.070,572,0.122,574,0.187,576,0.262,578,0.346,580,0.433,582,0.521,584,0.606,586,0.686,588,0.755,590,0.812,592,0.851,594,0.871,596,0.876,598,0.885,600,0.892,602,0.896,604,0.897,606,0.897,608,0.895,610,0.891,612,0.887,614,0.882,616,0.878,618,0.873,620,0.870,622,0.867,624,0.863,626,0.860,628,0.858,630,0.856,632,0.854,634,0.852,636,0.850,638,0.848,640,0.846,642,0.844,644,0.841,646,0.837,648,0.834,650,0.829,652,0.824,654,0.819,656,0.813,658,0.806,660,0.799,662,0.791,664,0.783,666,0.774,668,0.765,670,0.755,672,0.745,674,0.735,676,0.725,678,0.715,680,0.704,682,0.695,684,0.685,686,0.676,688,0.668,690,0.660,692,0.654,694,0.649,696,0.648,698,0.649,700,0.649";
    spcc.greenFilterTrCurve = "400,0.089,402,0.086,404,0.082,406,0.079,408,0.075,410,0.071,412,0.066,414,0.062,416,0.058,418,0.053,420,0.049,422,0.045,424,0.042,426,0.041,428,0.042,430,0.043,432,0.044,434,0.046,436,0.047,438,0.049,440,0.051,442,0.053,444,0.055,446,0.057,448,0.059,450,0.061,452,0.064,454,0.067,456,0.069,458,0.072,460,0.075,462,0.098,464,0.130,466,0.169,468,0.215,470,0.267,472,0.323,474,0.382,476,0.443,478,0.505,480,0.566,482,0.627,484,0.684,486,0.739,488,0.788,490,0.832,492,0.868,494,0.896,496,0.915,498,0.924,500,0.921,502,0.939,504,0.947,506,0.954,508,0.961,510,0.967,512,0.973,514,0.978,516,0.982,518,0.986,520,0.989,522,0.992,524,0.994,526,0.996,528,0.997,530,0.997,532,0.995,534,0.990,536,0.986,538,0.981,540,0.977,542,0.973,544,0.969,546,0.965,548,0.960,550,0.955,552,0.949,554,0.943,556,0.936,558,0.928,560,0.919,562,0.909,564,0.898,566,0.887,568,0.874,570,0.860,572,0.845,574,0.829,576,0.812,578,0.794,580,0.775,582,0.754,584,0.733,586,0.711,588,0.688,590,0.665,592,0.640,594,0.615,596,0.589,598,0.563,600,0.537,602,0.510,604,0.483,606,0.456,608,0.430,610,0.403,612,0.377,614,0.352,616,0.328,618,0.304,620,0.282,622,0.261,624,0.242,626,0.224,628,0.225,630,0.216,632,0.207,634,0.199,636,0.192,638,0.185,640,0.179,642,0.174,644,0.169,646,0.165,648,0.161,650,0.158,652,0.156,654,0.155,656,0.154,658,0.154,660,0.155,662,0.156,664,0.158,666,0.162,668,0.165,670,0.170,672,0.176,674,0.182,676,0.189,678,0.198,680,0.207,682,0.217,684,0.228,686,0.240,688,0.240,690,0.248,692,0.257,694,0.265,696,0.274,698,0.282,700,0.289";
    spcc.blueFilterTrCurve = "400,0.438,402,0.469,404,0.496,406,0.519,408,0.539,410,0.557,412,0.572,414,0.586,416,0.599,418,0.614,420,0.631,422,0.637,424,0.647,426,0.658,428,0.670,430,0.682,432,0.695,434,0.708,436,0.720,438,0.732,440,0.743,442,0.753,444,0.762,446,0.770,448,0.777,450,0.783,452,0.788,454,0.791,456,0.794,458,0.796,460,0.797,462,0.798,464,0.798,466,0.799,468,0.800,470,0.801,472,0.800,474,0.798,476,0.793,478,0.785,480,0.774,482,0.760,484,0.742,486,0.707,488,0.669,490,0.633,492,0.598,494,0.565,496,0.533,498,0.502,500,0.473,502,0.446,504,0.419,506,0.394,508,0.370,510,0.348,512,0.326,514,0.306,516,0.287,518,0.268,520,0.251,522,0.235,524,0.220,526,0.205,528,0.192,530,0.179,532,0.167,534,0.156,536,0.145,538,0.136,540,0.126,542,0.118,544,0.110,546,0.102,548,0.095,550,0.089,552,0.083,554,0.077,556,0.071,558,0.066,560,0.061,562,0.057,564,0.052,566,0.048,568,0.044,570,0.039,572,0.041,574,0.039,576,0.037,578,0.035,580,0.033,582,0.032,584,0.030,586,0.029,588,0.027,590,0.026,592,0.025,594,0.024,596,0.023,598,0.022,600,0.022,602,0.021,604,0.021,606,0.020,608,0.020,610,0.020,612,0.020,614,0.020,616,0.020,618,0.021,620,0.021,622,0.022,624,0.022,626,0.023,628,0.024,630,0.025,632,0.026,634,0.027,636,0.028,638,0.030,640,0.031,642,0.033,644,0.035,646,0.036,648,0.038,650,0.040,652,0.042,654,0.045,656,0.048,658,0.051,660,0.054,662,0.057,664,0.059,666,0.061,668,0.063,670,0.065,672,0.066,674,0.068,676,0.069,678,0.070,680,0.071,682,0.072,684,0.072,686,0.073,688,0.073,690,0.073,692,0.073,694,0.073,696,0.073,698,0.073,700,0.073";
@@ -3435,11 +3196,7 @@ beginStep( "Combination" );
    applyVisualSTF( combinedView, DEFAULT_AUTOSTRETCH_SCLIP, DEFAULT_AUTOSTRETCH_TBGND, true );
 
 		tick( "SPCC" );
-   // ---------------------------------------------------------
-   // Step 9: NoiseXTerminator on merged image
-   // (Parameter block here reflects the script’s current settings)
-   // ---------------------------------------------------------
-   beginStep( "NoiseXTerminator" );
+   beginStep( 7, "Noise Reduction (Linear)" );
 
    var rgbId = dlg.out_Edit.text;
    if ( !rgbId || !rgbId.trim().length ) rgbId = "RGB";
@@ -3457,7 +3214,6 @@ beginStep( "Combination" );
       nxt.enable_color_separation = false;
       nxt.enable_frequency_separation = false;
 
-      // UI controlled parameters
       nxt.denoise = Math.range( Number( dlg.nxtDenoise_Edit.text ), 0.0, 1.0 );
       if ( isNaN( nxt.denoise ) ) nxt.denoise = 0.50;
 
@@ -3476,10 +3232,7 @@ log( "Applying NXT to merged image: " + rgbId );
 		tick( "NXT" );
    }
 
-   // ---------------------------------------------------------
-   // Step 10: BlurXTerminator (linear sharpening) on *_NXT
-   // ---------------------------------------------------------
-   beginStep( "Applying BlurXTerminator" );
+   beginStep( 8, "Sharpening (Linear)" );
 
    var inId = (dlg.out_Edit && dlg.out_Edit.text) ? dlg.out_Edit.text + "_NXT" : "RGB_NXT";
    var win = ImageWindow.windowById( inId );
@@ -3516,11 +3269,7 @@ log( "Applying NXT to merged image: " + rgbId );
 		tick( "BXT sharpen" );
    }
 
-   // ---------------------------------------------------------
-   // Step 11: StarXTerminator (linear separation) on *_NXT_BXT
-   // Produces starless in the same window and a separate Stars window
-   // ---------------------------------------------------------
-   beginStep( "Running StarXTerminator" );
+   beginStep( 9, "Star Extraction" );
 
    var inId2 = (dlg.out_Edit && dlg.out_Edit.text) ? dlg.out_Edit.text + "_NXT_BXT" : "RGB_NXT_BXT";
    var win2 = ImageWindow.windowById( inId2 );
@@ -3545,8 +3294,6 @@ log( "Applying NXT to merged image: " + rgbId );
 
       log( "Starless image created: " + starlessId );
 
-      // Try to find the stars window and rename it deterministically.
-      // StarXTerminator typically creates a window named "Stars", but this can vary.
       var starsWin = ImageWindow.windowById( "Stars" );
       if ( starsWin == null || starsWin.isNull )
       {
@@ -3576,10 +3323,6 @@ log( "Applying NXT to merged image: " + rgbId );
 		tick( "SXT" );
    }
 
-   // ---------------------------------------------------------
-   // Step 12 (optional): HistogramTransformation stretch on linear Starless
-   // Creates a new stretched window (keeps linear starless intact)
-   // ---------------------------------------------------------
    var linId = "starless_linear";
    var linWin = ImageWindow.windowById( linId );
 
@@ -3591,12 +3334,20 @@ log( "Applying NXT to merged image: " + rgbId );
       }
       else
       {
-         // -----------------------------
-         // 12a: HT stretch (optional)
-         // -----------------------------
-         if ( dlg.stretch_Check && dlg.stretch_Check.checked )
+         beginStep( 10, "Stretching" );
+
+         var __doHT = ( dlg.stretch_Check && dlg.stretch_Check.checked );
+         var __doMAS = ( dlg.masApply_Check && dlg.masApply_Check.checked );
+
+         if ( !__doHT && !__doMAS )
          {
-            beginStep( "Applying LINKED Histogram stretch to Starless window" );
+            endStep( "Skipped (HT and MAS disabled)" );
+         }
+         else
+         {
+            if ( __doHT )
+            {
+               logSub( "HistogramTransformation stretch (STF to HT style)" );
 
             var htWin = new ImageWindow(
                linWin.mainView.image.width,
@@ -3632,7 +3383,6 @@ log( "Applying NXT to merged image: " + rgbId );
 
             avgC0 = Math.range( avgC0/n, 0.0, 1.0 );
 
-            // Allow UI override of DEFAULT_AUTOSTRETCH_TBGND (target background)
             var htTbgnd = DEFAULT_AUTOSTRETCH_TBGND;
             try
             {
@@ -3659,7 +3409,6 @@ log( "Applying NXT to merged image: " + rgbId );
             log( "Executing LINKED stretch on: " + htView.id );
             ht.executeOn( htView );
 
-            // Reset STF on the stretched result
             htView.stf = [
                [0.5, 0, 1, 0, 1],
                [0.5, 0, 1, 0, 1],
@@ -3675,13 +3424,9 @@ log( "Applying NXT to merged image: " + rgbId );
             log( "HT stretch disabled (skipping HistogramTransformation stretch)." );
          }
 
-         // -----------------------------
-         // 12b: MAS stretch (optional)
-         // Applied to a NEW copy of the linear image
-         // -----------------------------
          if ( dlg.masApply_Check && dlg.masApply_Check.checked )
          {
-            beginStep( "Applying Multiscale Adaptive Stretch (MAS) to linear Starless window" );
+            logSub( "Multiscale Adaptive Stretch (MAS)" );
 
             var masWin = new ImageWindow(
                linWin.mainView.image.width,
@@ -3736,7 +3481,6 @@ log( "Applying NXT to merged image: " + rgbId );
             log( "Executing MAS on: " + masView.id );
             P.executeOn( masView );
 
-            // Reset STF on the stretched result
             masView.stf = [
                [0.5, 0, 1, 0, 1],
                [0.5, 0, 1, 0, 1],
@@ -3754,11 +3498,6 @@ log( "Applying NXT to merged image: " + rgbId );
       }
    }
 
-   // ---------------------------------------------------------
-   // Optional Nonlinear passes (in place, starless only)
-   // Applies only to HT_starless and/or MAS_starless if they exist.
-   // Does NOT rename images or create new windows.
-   // ---------------------------------------------------------
 
    function applyNonlinearNXT( id )
    {
@@ -3833,34 +3572,33 @@ log( "Applying NXT to merged image: " + rgbId );
    if ( dlg.masApply_Check && dlg.masApply_Check.checked )
       __targets.push( "MAS_starless" );
 
-   // If neither HT nor MAS produced a starless stretched image, nonlinear steps have no targets.
    if ( __targets.length == 0 )
       log( "No stretched starless targets found (nonlinear steps will have nothing to do)." );
 
    if ( dlg.nlNxtApply_Check && dlg.nlNxtApply_Check.checked )
    {
-      beginStep( "Applying NoiseXTerminator (Nonlinear) to starless stretched images" );
+      beginStep( 11, "Noise Reduction (Nonlinear)" );
       for ( var __t = 0; __t < __targets.length; ++__t )
          applyNonlinearNXT( __targets[__t] );
    }
    else
    {
-      log( "Nonlinear Noise Reduction disabled (skipping)." );
+      beginStep( 11, "Noise Reduction (Nonlinear)" );
+      endStep( "Skipped (Nonlinear NXT disabled)" );
    }
+
 
    if ( dlg.nlBxtApply_Check && dlg.nlBxtApply_Check.checked )
    {
-      beginStep( "Applying BlurXTerminator (Nonlinear) to starless stretched images" );
+      beginStep( 12, "Sharpening (Nonlinear)" );
       for ( var __t2 = 0; __t2 < __targets.length; ++__t2 )
          applyNonlinearBXT( __targets[__t2] );
    }
    else
    {
-      log( "Nonlinear Sharpening disabled (skipping)." );
+      beginStep( 12, "Sharpening (Nonlinear)" );
+      endStep( "Skipped (Nonlinear BXT disabled)" );
    }
-   // Final cleanup: keep only final deliverables
-   // Remaining windows should be:
-   // stars_linear, starless_linear, HT_starless (if created), MAS_starless (if created)
    var __keep = {
       "stars_linear": true,
       "starless_linear": true,
@@ -3879,7 +3617,6 @@ log( "Applying NXT to merged image: " + rgbId );
       if ( __keep[__id] )
          continue;
 
-      // Close without prompting to save
       __w.forceClose();
    }
 
@@ -3897,22 +3634,29 @@ log( "Applying NXT to merged image: " + rgbId );
    log( "-----------------------------" );
 
 
-   // Persist configuration after successful run
    sbppTrySaveCurrentConfiguration( dlg, log );
 
-   //if ( __elapsed.length > 0 )
-   //   (new MessageBox( "R U N   C O M P L E T E D\n\nElapsed time: " + __elapsed, "SBPP", 0, StdButton_Ok )).execute();
-   //else
-   //   (new MessageBox( "R U N   C O M P L E T E D", "SBPP", 0, StdButton_Ok )).execute();
 
 }
-
-// ------------------------------------------------------------
-// Entry point
-// ------------------------------------------------------------
+}
 
 function main()
 {
-   (new WorkflowDialog).execute();
+   try
+   {
+      (new WorkflowDialog).execute();
+   }
+   catch ( e )
+   {
+      try
+      {
+         var s = ( e && e.toString ) ? e.toString() : String( e );
+         if ( s.indexOf( "__SBPP_PREREQ__" ) >= 0 )
+            return;
+      }
+      catch ( __e2 ) {}
+
+      throw e;
+   }
 }
 main();
