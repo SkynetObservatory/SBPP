@@ -199,7 +199,7 @@ Earlier extraction increases the risk of residual artifacts leaking into either 
   * HistogramTransformation (STF-style), or
   * Multiscale Adaptive Stretch
 
-### Why stretching is late
+### Why stretching this late
 
 Stretching is irreversible. By postponing it:
 
