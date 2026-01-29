@@ -93,6 +93,121 @@ function pumpEvents()
    }
 }
 
+/*
+ * findBackground
+ * Finds a "background-like" region in a clean, flat, starless image.
+ * Returns the top-left coordinates of the best region using a robust score (median + k*MAD).
+ *
+ * Params:
+ *   imageIdentifier (string) : view id
+ *   regionWidth (int)        : ROI width in pixels
+ *   regionHeight (int)       : ROI height in pixels
+ *
+ * Returns:
+ *   { left: int, top: int }
+ */
+function findBackground( imageIdentifier, regionWidth, regionHeight )
+{
+   var view = View.viewById( imageIdentifier );
+   if ( view === null )
+      throw new Error( "findBackground: view not found: " + imageIdentifier );
+
+   var img = view.image;
+   var W = img.width;
+   var H = img.height;
+
+   if ( W < regionWidth || H < regionHeight )
+      throw new Error( "findBackground: region larger than image." );
+
+   // Tunables (internal)
+   var marginFrac = 0.08; // ignore borders
+   var step = Math.max( 25, Math.round( Math.min( regionWidth, regionHeight ) ) ); // coarse grid
+   var stride = 2; // subsample inside ROI for speed (2 => 25x25 samples in a 50x50 ROI)
+
+   var mx = Math.round( W * marginFrac );
+   var my = Math.round( H * marginFrac );
+
+   var x0 = mx;
+   var y0 = my;
+   var x1 = W - mx - regionWidth;
+   var y1 = H - my - regionHeight;
+
+   if ( x1 <= x0 || y1 <= y0 )
+   {
+      x0 = 0;
+      y0 = 0;
+      x1 = W - regionWidth;
+      y1 = H - regionHeight;
+   }
+
+   function medianOfArray( a )
+   {
+      var b = a.slice( 0 );
+      b.sort( function( p, q ) { return p - q; } );
+      var n = b.length;
+      if ( n < 1 ) return 0;
+      var mid = Math.floor( n / 2 );
+      return ( n & 1 ) ? b[mid] : 0.5*( b[mid-1] + b[mid] );
+   }
+
+   function madOfArray( a, med )
+   {
+      var d = new Array( a.length );
+      for ( var i = 0; i < a.length; ++i )
+         d[i] = Math.abs( a[i] - med );
+      return medianOfArray( d );
+   }
+
+   function roiSamples( x, y, ww, hh )
+   {
+      var r = new Rect( x, y, x + ww, y + hh );
+
+      // Pull channel 0 samples (starless + clean => good enough; fast).
+      // getSamples fills the array with ww*hh values in row-major order.
+      var raw = new Array( ww*hh );
+      img.getSamples( raw, r, 0 );
+
+      if ( stride <= 1 ) return raw;
+
+      // Subsample to reduce work (every stride pixels in x and y)
+      var out = [];
+      for ( var yy = 0; yy < hh; yy += stride )
+      {
+         var rowBase = yy * ww;
+         for ( var xx = 0; xx < ww; xx += stride )
+            out.push( raw[rowBase + xx] );
+      }
+      return out;
+   }
+
+   var bestScore = 1e30;
+   var bestX = x0;
+   var bestY = y0;
+
+   var k = 1.5; // structure penalty weight
+
+   for ( var y = y0; y <= y1; y += step )
+      for ( var x = x0; x <= x1; x += step )
+      {
+         var s = roiSamples( x, y, regionWidth, regionHeight );
+         var med = medianOfArray( s );
+         var mad = madOfArray( s, med );
+
+         var score = med + k * mad;
+
+         if ( score < bestScore )
+         {
+            bestScore = score;
+            bestX = x;
+            bestY = y;
+         }
+      }
+
+   return { left: bestX, top: bestY };
+}
+
+
+
 function pauseMs( ms )
 {
    var t0 = (new Date).getTime();
@@ -391,7 +506,8 @@ function sbppCollectConfig( dlg )
    try { cfg.masTbg = dlg.masTbg_Edit.text; } catch ( __e ) {}
    try { cfg.masDRC = dlg.masDRC_Edit.text; } catch ( __e ) {}
    try { cfg.masAgg = dlg.masAgg_Edit.text; } catch ( __e ) {}
-   try { cfg.masScale = dlg.masScale_Edit.text; } catch ( __e ) {}
+   try { cfg.masScale = (dlg.masScale_Combo ? dlg.masScale_Combo.itemText( dlg.masScale_Combo.currentItem ) : "1024");
+   try { cfg.masCRIntensity = dlg.masCRIntensity_Edit ? dlg.masCRIntensity_Edit.text : "1.00"; } catch ( __e ) {} } catch ( __e ) {}
    try { cfg.masSatEnabled = dlg.masSatEnabled_Check.checked; } catch ( __e ) {}
    try { cfg.masSatLM = dlg.masSatLM_Check.checked; } catch ( __e ) {}
    try { cfg.masSatBoost = dlg.masSatBoost_Edit.text; } catch ( __e ) {}
@@ -523,8 +639,27 @@ function sbppApplyConfig( dlg, cfg )
       if ( cfg.masAgg !== undefined && dlg.masAgg_Edit )
          dlg.masAgg_Edit.text = cfg.masAgg;
 
-      if ( cfg.masScale !== undefined && dlg.masScale_Edit )
-         dlg.masScale_Edit.text = cfg.masScale;
+      if ( cfg.masScale !== undefined && dlg.masScale_Combo )
+{
+   var __ms = String( cfg.masScale );
+   var __idx = -1;
+   for ( var __i = 0; __i < dlg.masScale_Combo.numberOfItems; ++__i )
+      if ( String( dlg.masScale_Combo.itemText( __i ) ) === __ms ) { __idx = __i; break; }
+   if ( __idx < 0 )
+      __idx = 10; // default 1024
+   dlg.masScale_Combo.currentItem = __idx;
+}
+
+if ( cfg.masCRIntensity !== undefined && dlg.masCRIntensity_Edit && dlg.masCRIntensity_Slider )
+{
+   var __ci = Number( cfg.masCRIntensity );
+   if ( !isFinite( __ci ) ) __ci = 1.0;
+   __ci = Math.range( __ci, 0.0, 1.0 );
+   dlg.masCRIntensity_Slider.value = Math.round( __ci * 1000 );
+   dlg.masCRIntensity_Edit.text = format( "%.2f", __ci );
+}
+
+
 
       if ( cfg.masSatEnabled !== undefined && dlg.masSatEnabled_Check )
          dlg.masSatEnabled_Check.checked = !!cfg.masSatEnabled;
@@ -925,6 +1060,7 @@ function WorkflowDialog()
    this.detected = [];
 
    this.__userHasSelectedFiles = false;
+   this.__statsReady = false;
 
    function row( parent, labelText, control )
    {
@@ -1299,8 +1435,34 @@ this.ht_Group.sizer.add( htRow );
 
    this.masContrast_Check = new CheckBox( this );        this.masContrast_Check.text = "Contrast Recovery"; this.masContrast_Check.checked = true;
 
-   this.masScale_Edit = new Edit( this );       this.masScale_Edit.text = "7";
-   this.masPreview_Check = new CheckBox( this );         this.masPreview_Check.text = "Preview Large Scale"; this.masPreview_Check.checked = false;
+   this.masScale_Combo = new ComboBox( this );
+   this.masScale_Combo.addItem( "8" );
+   this.masScale_Combo.addItem( "16" );
+   this.masScale_Combo.addItem( "32" );
+   this.masScale_Combo.addItem( "64" );
+   this.masScale_Combo.addItem( "128" );
+   this.masScale_Combo.addItem( "192" );
+   this.masScale_Combo.addItem( "256" );
+   this.masScale_Combo.addItem( "384" );
+   this.masScale_Combo.addItem( "512" );
+   this.masScale_Combo.addItem( "768" );
+   this.masScale_Combo.addItem( "1024" );
+   this.masScale_Combo.currentItem = 10;
+   
+this.masCRIntensity_Edit = new Edit( this );
+this.masCRIntensity_Edit.text = "1.00";
+this.masCRIntensity_Edit.setFixedWidth( 60 );
+this.masCRIntensity_Edit.toolTip = "Contrast Recovery Intensity (0.00 to 1.00).";
+
+this.masCRIntensity_Slider = new Slider( this );
+this.masCRIntensity_Slider.minValue = 0;
+this.masCRIntensity_Slider.maxValue = 1000;
+this.masCRIntensity_Slider.pageSize = 50;
+this.masCRIntensity_Slider.tracking = true;
+this.masCRIntensity_Slider.setRange( 0, 1000 );
+this.masCRIntensity_Slider.value = 1000;
+
+this.masPreview_Check = new CheckBox( this );         this.masPreview_Check.text = "Preview Large Scale"; this.masPreview_Check.checked = false;
 
    this.masSatEnabled_Check = new CheckBox( this );      this.masSatEnabled_Check.text = "Enable Saturation"; this.masSatEnabled_Check.checked = true;
 
@@ -1312,31 +1474,56 @@ this.ht_Group.sizer.add( htRow );
 
    this.masSatLM_Check = new CheckBox( this );           this.masSatLM_Check.text = "Saturation Lightness Mask"; this.masSatLM_Check.checked = true;
 
-   function linkEditSlider01( edit, slider )
+function linkEditSlider01( edit, slider )
+{
+   function clamp01( x )
    {
-      function clamp01( x )
-      {
-         x = parseFloat( x );
-         if ( isNaN( x ) ) x = 0;
-         if ( x < 0 ) x = 0;
-         if ( x > 1 ) x = 1;
-         return x;
-      }
-
-      edit.setFixedWidth( 70 );
-
-      edit.onTextUpdated = function( s )
-      {
-         var v = clamp01( s );
-         slider.value = Math.round( v * 100 );
-         edit.text = format( "%.2f", v );
-      };
-
-      slider.onValueUpdated = function( v )
-      {
-         edit.text = format( "%.2f", v / 100 );
-      };
+      x = parseFloat( x );
+      if ( isNaN( x ) ) x = 0;
+      if ( x < 0 ) x = 0;
+      if ( x > 1 ) x = 1;
+      return x;
    }
+
+   edit.onTextUpdated = function( s )
+   {
+      var v = clamp01( s );
+      slider.value = Math.round( v * 100 );
+      edit.text = format( "%.2f", v );
+   };
+
+   slider.onValueUpdated = function( v )
+   {
+      edit.text = format( "%.2f", v / 100 );
+   };
+}
+
+// 0..1 slider with higher resolution (default k=1000 => 0.001 steps)
+function linkEditSlider01k( edit, slider, k )
+{
+   if ( k === undefined ) k = 1000;
+
+   function clamp01( x )
+   {
+      x = parseFloat( x );
+      if ( isNaN( x ) ) x = 0;
+      if ( x < 0 ) x = 0;
+      if ( x > 1 ) x = 1;
+      return x;
+   }
+
+   edit.onTextUpdated = function( s )
+   {
+      var v = clamp01( s );
+      slider.value = Math.round( v * k );
+      edit.text = format( "%.2f", v );
+   };
+
+   slider.onValueUpdated = function( v )
+   {
+      edit.text = format( "%.2f", v / k );
+   };
+}
 
    linkEditSlider01( this.masAgg_Edit, this.masAgg_Slider );
    linkEditSlider01( this.masTbg_Edit, this.masTbg_Slider );
@@ -1344,12 +1531,15 @@ this.ht_Group.sizer.add( htRow );
    linkEditSlider01( this.masSatAmt_Edit, this.masSatAmt_Slider );
    linkEditSlider01( this.masSatBoost_Edit, this.masSatBoost_Slider );
 
+   linkEditSlider01k( this.masCRIntensity_Edit, this.masCRIntensity_Slider, 1000 );
+
    var MAS_SLIDER_W = 480;
    this.masAgg_Slider.setFixedWidth( MAS_SLIDER_W );
    this.masTbg_Slider.setFixedWidth( MAS_SLIDER_W );
    this.masDRC_Slider.setFixedWidth( MAS_SLIDER_W );
    this.masSatAmt_Slider.setFixedWidth( MAS_SLIDER_W );
    this.masSatBoost_Slider.setFixedWidth( MAS_SLIDER_W );
+   this.masCRIntensity_Slider.setFixedWidth( MAS_SLIDER_W );
 
    this.mas_Group.sizer = new VerticalSizer;
    this.mas_Group.sizer.margin = 6;
@@ -1377,10 +1567,19 @@ this.ht_Group.sizer.add( htRow );
    this.mas_Group.sizer.add( this.masContrast_Check );
 
    var masRow4 = new HorizontalSizer; masRow4.spacing = 6;
-   var masScaleLabel = new Label( this ); masScaleLabel.text = "Scale Separation:"; masScaleLabel.textAlignment = 2 | 8; masScaleLabel.setFixedWidth( MAS_LABEL_W );
-   this.masScale_Edit.setFixedWidth( 70 );
-   masRow4.add( masScaleLabel ); masRow4.add( this.masScale_Edit ); masRow4.addStretch();
-   this.mas_Group.sizer.add( masRow4 );
+var masScaleLabel = new Label( this ); masScaleLabel.text = "Scale Separation:"; masScaleLabel.textAlignment = 2 | 8; masScaleLabel.setFixedWidth( MAS_LABEL_W );
+this.masScale_Combo.setFixedWidth( 110 );
+
+var masIntLabel = new Label( this ); masIntLabel.text = "Intensity:"; masIntLabel.textAlignment = 2 | 8; masIntLabel.setFixedWidth( 90 );
+
+masRow4.add( masScaleLabel );
+masRow4.add( this.masScale_Combo );
+masRow4.addSpacing( 12 );
+masRow4.add( masIntLabel );
+masRow4.add( this.masCRIntensity_Edit );
+masRow4.add( this.masCRIntensity_Slider );
+masRow4.addStretch();
+this.mas_Group.sizer.add( masRow4 );
 
    this.mas_Group.sizer.add( this.masPreview_Check );
 
@@ -1414,7 +1613,9 @@ this.ht_Group.sizer.add( htRow );
       dlg.masSatEnabled_Check.enabled = master;
 
       var cr = master && dlg.masContrast_Check.checked;
-      dlg.masScale_Edit.enabled = cr;
+      dlg.masScale_Combo.enabled = cr;
+      dlg.masCRIntensity_Edit.enabled = cr;
+      dlg.masCRIntensity_Slider.enabled = cr;
       dlg.masPreview_Check.enabled = cr;
 
       var sat = master && dlg.masSatEnabled_Check.checked;
@@ -1851,13 +2052,12 @@ this.ht_Group.sizer.add( htRow );
 
    this.updateRunButtonState = function()
    {
-      if ( !this.__userHasSelectedFiles )
+      if ( !this.__userHasSelectedFiles || !this.__statsReady )
       {
          this.ok_Button.enabled = false;
          return;
       }
-
-      var n = ( this.files && this.files.length ) ? this.files.length : 0;
+var n = ( this.files && this.files.length ) ? this.files.length : 0;
       var isSHO = ( this.mode_Combo.currentItem === 0 );
       var isRGB = ( this.mode_Combo.currentItem === 1 );
 
@@ -2086,7 +2286,11 @@ this.ht_Group.sizer.add( htRow );
    {
       this.__refPreview = null;
 
-      if ( !this.files || this.files.length < 1 )
+      
+
+      this.__statsReady = false;
+      this.updateRunButtonState();
+if ( !this.files || this.files.length < 1 )
       {
          if ( this.refHigh_Radio )    this.refHigh_Radio.text    = "Use lowest signal value";
          if ( this.refMedium_Radio )  this.refMedium_Radio.text  = "Use medium signal value";
@@ -2183,6 +2387,9 @@ this.ht_Group.sizer.add( htRow );
       if ( this.refHigh_Radio )    this.refHigh_Radio.text    = "Use lowest signal value ( "  + this._formatRefStatText( lowest )  + " )";
       if ( this.refMedium_Radio )  this.refMedium_Radio.text  = "Use medium signal value ( "  + this._formatRefStatText( medium )  + " )";
       if ( this.refHighest_Radio ) this.refHighest_Radio.text = "Use highest signal value ( " + this._formatRefStatText( highest ) + " )";
+
+      this.__statsReady = true;
+      this.updateRunButtonState();
 
       this.updateLinearFitLabel();
    };
@@ -2345,6 +2552,8 @@ if ( fd.execute() )
          dlg.files = fd.fileNames;
          
          dlg.__userHasSelectedFiles = true;
+         dlg.__statsReady = false;
+         dlg.updateRunButtonState();
 dlg.detected = [];
 
          for ( var i = 0; i < dlg.files.length; i++ )
@@ -3446,6 +3655,26 @@ log( "Applying NXT to merged image: " + rgbId );
             var masView = masWin.mainView;
 
             var P = new MultiscaleAdaptiveStretch;
+// Locate background ROI for MAS (clean, flat, starless input assumed)
+try
+{
+   sbppUiLog( dlg, "Locating background region (50x50)..." );
+   var __bg = findBackground( masView.fullId, 50, 50 );
+   sbppUiLog( dlg, format( "Background ROI located at Left=%d, Top=%d", __bg.left, __bg.top ) );
+
+   P.backgroundROIEnabled = true;
+   P.backgroundROIX0 = __bg.left;
+   P.backgroundROIY0 = __bg.top;
+   P.backgroundROIWidth = 50;
+   P.backgroundROIHeight = 50;
+}
+catch ( __eBG )
+{
+   sbppUiLog( dlg, "Warning: Background region location failed. Proceeding without ROI. (" + __eBG + ")" );
+   P.backgroundROIEnabled = false;
+}
+
+
 
             P.aggressiveness = Number( dlg.masAgg_Edit.text );
             if ( isNaN( P.aggressiveness ) ) P.aggressiveness = 0.70;
@@ -3461,8 +3690,29 @@ log( "Applying NXT to merged image: " + rgbId );
 
             P.contrastRecovery = !!dlg.masContrast_Check.checked;
 
-            P.scaleSeparation = parseInt( dlg.masScale_Edit.text, 10 );
-            if ( isNaN( P.scaleSeparation ) ) P.scaleSeparation = 7;
+            P.scaleSeparation = 1024;
+try
+{
+   if ( dlg.masScale_Combo )
+   {
+      var __msText = String( dlg.masScale_Combo.itemText( dlg.masScale_Combo.currentItem ) );
+      var __msVal = Number( __msText );
+      if ( isFinite( __msVal ) ) P.scaleSeparation = __msVal;
+   }
+}
+catch ( __eMS ) { P.scaleSeparation = 1024; }
+
+P.contrastRecoveryIntensity = 1.0;
+try
+{
+   var __ci = Number( dlg.masCRIntensity_Edit ? dlg.masCRIntensity_Edit.text : 1.0 );
+   if ( !isFinite( __ci ) ) __ci = 1.0;
+   P.contrastRecoveryIntensity = Math.range( __ci, 0.0, 1.0 );
+}
+catch ( __eCI ) { P.contrastRecoveryIntensity = 1.0; }
+
+
+
 
             P.previewLargeScale = !!dlg.masPreview_Check.checked;
 
