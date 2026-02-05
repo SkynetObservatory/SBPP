@@ -1054,7 +1054,7 @@ function WorkflowDialog()
    this.__base__();
    var dlg = this;
 
-   this.windowTitle = "Skynet Batch Post-Processing (v1.9 Skynet Observatory, © 2026)";
+   this.windowTitle = "Skynet Batch Post-Processing (v1.95 Skynet Observatory, © 2026)";
    this.mode = "SHO";
    this.files = [];
    this.detected = [];
