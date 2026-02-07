@@ -1,16 +1,16 @@
-<updates>
-   <repository>
-      <script>
-         <name>Skynet Batch Post Processing Script</name>
-         <version>1.95.0</version>
-         <releaseDate>2026-02-06</releaseDate>
-         <description>Batch post processing script for PixInsight</description>
-         <url>https://raw.githubusercontent.com/SkynetObservatory/SBPP/main/BatchPostProcessing.js</url>
-         <checksum>9591e47873c5e1c028ecc4d73c6e89c497561d96</checksum>
-      </script>
-   </repository>
-
-</updates>
+<?xml version="1.0" encoding="UTF-8"?>
+<xri>
+  <repository>
+    <package
+      fileName="sbpp-20260206.zip"
+      type="script"
+      releaseDate="20260206"
+      sha1="e3048851f27d3dbb3d94d5344ca6e88b44a19843">
+      <title>Skynet Batch Post Processing Script</title>
+      <description>Batch post processing script for PixInsight</description>
+    </package>
+  </repository>
+</xri>
 
 
 
