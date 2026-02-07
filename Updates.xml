@@ -5,9 +5,10 @@
          <version>1.95.0</version>
          <releaseDate>2026-02-06</releaseDate>
          <description>Batch post processing script for PixInsight</description>
-         <url>https://skynetobservatory.github.io/SBPP/BatchPostProcessing.js</url>
+         <url>https://raw.githubusercontent.com/SkynetObservatory/SBPP/main/BatchPostProcessing.js</url>
          <checksum>9591e47873c5e1c028ecc4d73c6e89c497561d96</checksum>
       </script>
    </repository>
 
 </updates>
+
