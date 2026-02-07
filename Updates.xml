@@ -1,7 +1,7 @@
 <updates>
    <repository>
       <script>
-         <name>Skynet Batch Post Processing (SBPP)</name>
+         <name>Skynet Batch Post Processing Script</name>
          <version>1.95.0</version>
          <releaseDate>2026-02-06</releaseDate>
          <description>Batch post processing script for PixInsight</description>
@@ -11,4 +11,5 @@
    </repository>
 
 </updates>
+
 
