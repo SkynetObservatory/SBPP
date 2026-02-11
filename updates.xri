@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xri version="1.0">
+  <description>
+    <p>
+      <b>Skynet Batch Post Processing (SBPP) Repository</b><br/>
+      Batch post processing script for PixInsight.
+    </p>
+  </description>
+
+  <!-- Update Package Configuration -->
+  <platform os="all" arch="noarch" version="1.8.9:1.9.9">
+    <package
+      fileName="sbpp-20260211.zip"
+      sha1="595c66ee3118c42ae050c14c6d96d9d3c259b8b2"
+      type="script"
+      releaseDate="20260211">
+      <title>Skynet Batch Post Processing Script</title>
+      <description>
+        <p>
+          SBPP: Repeatable linear conditioning workflow for WBPP outputs.
+        </p>
+      </description>
+    </package>
+  </platform>
+</xri>
